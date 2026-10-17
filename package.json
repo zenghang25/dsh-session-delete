@@ -1,0 +1,53 @@
+{
+  "name": "dsh-session-delete",
+  "version": "0.3.0",
+  "private": true,
+  "description": "Delete one conversation (Session) from the Harness sidebar by moving its local log records to the Windows Recycle Bin",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-workspace"
+      ]
+    }
+  },
+  "icon": "./icon.svg",
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "icon.svg",
+    "locale/*.json"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zenghang25/dsh-session-delete.git"
+  },
+  "homepage": "https://github.com/zenghang25/dsh-session-delete#readme",
+  "bugs": {
+    "url": "https://github.com/zenghang25/dsh-session-delete/issues"
+  },
+  "author": "zenghang25",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "session",
+    "delete"
+  ],
+  "license": "MIT"
+}

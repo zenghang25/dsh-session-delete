@@ -1,0 +1,12 @@
+# dsh-session-delete — profile patch shipped with the package.
+#
+# A package whose manifest declares `dsh.bundle.patch` is applied as its own
+# bundle layer as soon as `dsh plugin --profile <name> add <package>` adds the
+# package to the profile's `dsh.profile.bundles`; editing the profile's own
+# cordis.patch.yml is not needed.
+#
+# Manual fallback (without `dsh plugin`): add the same `insert` entry below to
+# the profile's cordis.patch.yml.
+- insert:
+    - id: dsh-session-delete
+      name: dsh-session-delete
