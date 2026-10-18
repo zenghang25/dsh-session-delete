@@ -1,5 +1,5 @@
 /**
- * dsh-session-delete v0.5.0 — 会话删除（Client 半）
+ * dsh-session-delete v0.5.1 — 会话删除（Client 半）
  *
  * 只做一件事：在会话行的「⋯」菜单里注册一个「删除会话」项，点击后直接删除，不弹确认框。
  *
@@ -87,12 +87,44 @@ window.__ModuleLoader__.load({
 					if (hiddenIds.length > 200) hiddenIds = hiddenIds.slice(-200);
 					saveHidden();
 				}
+				enforceHidden();
 			}
 			for (var hiddenIndex = 0; hiddenIndex < hiddenIds.length; hiddenIndex += 1) {
 				try {
 					styleTag.textContent += '[role="treeitem"][data-row-key="session:' + hiddenIds[hiddenIndex] + '"]{display:none!important;}';
 				} catch (error) {}
 			}
+
+			/* 删除过的会话不能只靠 CSS 隐藏行：只要它的 summary 还在会话列表 store 里，
+			 * 「未分组」这个分组头本身仍会渲染。这里在会话列表 store 上持续兜底：
+			 * 隐藏 id 一旦又出现在列表里，就立刻 handleSessionRemoved 摘掉。 */
+			var enforceHidden = function () {};
+			try {
+				var hiddenController = sessionsService();
+				if (hiddenController !== null && hiddenController.list !== undefined && hiddenController.list !== null &&
+					typeof hiddenController.list.getSnapshot === 'function' && typeof hiddenController.list.subscribe === 'function') {
+					enforceHidden = function () {
+						try {
+							var hiddenSnapshot = hiddenController.list.getSnapshot();
+							if (hiddenSnapshot === null || hiddenSnapshot === undefined || !Array.isArray(hiddenSnapshot.ids)) return;
+							for (var hiddenRow = 0; hiddenRow < hiddenIds.length; hiddenRow += 1) {
+								var hiddenId = hiddenIds[hiddenRow];
+								if (hiddenSnapshot.ids.indexOf(hiddenId) !== -1 && typeof hiddenController.handleSessionRemoved === 'function') {
+									hiddenController.handleSessionRemoved(hiddenId);
+								}
+							}
+						} catch (error) {}
+					};
+					var unsubscribeHidden = hiddenController.list.subscribe(enforceHidden);
+					if (typeof unsubscribeHidden === 'function') {
+						ctx.effect(function () {
+							return function () { unsubscribeHidden(); };
+						}, 'dsh-session-delete: hidden-row enforcement');
+					}
+					setTimeout(enforceHidden, 800);
+					setTimeout(enforceHidden, 3000);
+				}
+			} catch (error) {}
 
 			/* 兼容清理：旧版本删除过、但宿主仍把 live 会话留在内存里的「幽灵行」。
 			 * 判定：已归档 + live + 不属于任何工作区 + 没有落盘（persisted=false）。 */
@@ -181,10 +213,14 @@ window.__ModuleLoader__.load({
 					}
 				}
 				removeLocally();
+				enforceHidden();
 				try {
 					if (typeof service.refresh === 'function') {
 						/* 刷新会把宿主持有的 live 会话重新列出来，所以刷新完成后再摘一次。 */
-						Promise.resolve(service.refresh()).then(removeLocally, function (error) {
+						Promise.resolve(service.refresh()).then(function () {
+							removeLocally();
+							enforceHidden();
+						}, function (error) {
 							console.error('[dsh-session-delete] list refresh', error);
 						});
 					}
@@ -290,7 +326,7 @@ window.__ModuleLoader__.load({
 				};
 			}, 'dsh-session-delete: client cleanup');
 
-			console.log('[dsh-session-delete] client ready v0.5.0, lang=' + localeId);
+			console.log('[dsh-session-delete] client ready v0.5.1, lang=' + localeId);
 		}
 
 		exports.apply = apply;

@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-delete",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "private": true,
   "description": "One-click session deletion for the Harness sidebar: moves the session log and its per-conversation artifact directory (.dsh-sessions/<session-id>/) to the Windows Recycle Bin (recoverable) after stopping running work.",
   "type": "module",

@@ -103,6 +103,18 @@ const sessions = {
     return Promise.resolve()
   },
 }
+/* 会话列表 store 桩：验证「隐藏行在列表里再次出现时会被立刻摘掉」。 */
+let listSnapshot = { ids: [], byId: {} }
+const listListeners = new Set()
+sessions.list = {
+  getSnapshot() {
+    return listSnapshot
+  },
+  subscribe(listener) {
+    listListeners.add(listener)
+    return () => listListeners.delete(listener)
+  },
+}
 const workspacesArchived = []
 const workspaces = {
   archiveSession(id) {
@@ -195,6 +207,10 @@ assert.deepEqual(workspacesArchived, ['s1'], '删除后同步客户端归档集�
 const styleTag = document.head.children.find((el) => el.tagName === 'STYLE')
 assert.ok(styleTag.textContent.includes('data-row-key="session:s1"'), '删除过的行被 CSS 永久隐藏')
 assert.ok(storage.get('dsh-session-delete.hidden.v1').includes('s1'), '隐藏 id 已持久化')
+/* 列表基线再次把这个会话带回来时，订阅兜底必须立刻把它摘掉（否则「未分组」分组头还会出现）。 */
+listSnapshot = { ids: ['s1'], byId: { s1: { sessionId: 's1' } } }
+for (const listener of listListeners) listener()
+assert.ok(sessions.removed.length >= 2, '会话列表再次带回时被兜底摘掉')
 assert.ok(document.body.children.some((el) => String(el.attributes.class).includes('dsd-toast')), '出现成功提示')
 assert.ok(!document.body.children.some((el) => String(el.attributes.class).includes('dsd-toast-error')), '成功时不显示错误样式')
 
