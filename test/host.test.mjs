@@ -267,6 +267,8 @@ try {
     assert.ok(harness.calls.archive.some((entry) => entry.id === 'session-stuck' && entry.stop === true), '先归档停写')
     assert.equal(await exists(join(home, 'sessions', '--proj--', 'session-stuck')), false, '日志目录已删除')
     assert.equal(await exists(join(cwd, '.dsh-sessions', 'session-stuck')), false, '产出目录已删除')
+    assert.ok(state.archived.includes('session-stuck'), '仍 live 的会话保持归档，避免在侧栏「未分组」复活')
+    assert.ok(!harness.calls.unarchive.includes('session-stuck'), '不对仍 live 的会话取消归档')
   })
 
   await test('物理删除失败：回滚归档，让会话恢复可见而不是灰着不放', async () => {
@@ -399,7 +401,7 @@ try {
     const res = await callRoute(harness.routes, '/dsh-session-delete/ping', {})
     assert.equal(res.status, 200)
     assert.equal(res.payload.ok, true)
-    assert.equal(res.payload.version, '0.4.1')
+    assert.equal(res.payload.version, '0.4.5')
   })
 } finally {
   await fsp.rm(testRoot, { recursive: true, force: true, maxRetries: 3 })

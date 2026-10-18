@@ -32,7 +32,7 @@ import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 
 const MODULE = '[dsh-session-delete]'
-const VERSION = '0.4.1'
+const VERSION = '0.4.5'
 /** 会话产出目录名：放在工作目录下，与工作区内容区分。 */
 const ARTIFACT_DIRNAME = '.dsh-sessions'
 /** 请求体上限：唯一合法的请求体就是一个小对象。 */
@@ -394,13 +394,26 @@ async function deleteSession(deps, rootId) {
     if (!result.ok) failures.push({ path: artifactDir, error: textOf(result.error !== null && result.error !== undefined && result.error.message) })
   }
 
-  /* 8) 从置顶/归档集合移除（未归档/未置顶时这些调用是 no-op）。 */
+  /* 8) 清理置顶/归档账目。
+   *    关键：仍在内存里的 live 会话不能 unarchive —— 宿主的 session 列表仍会返回它，
+   *    取消归档会让它重新出现在侧栏（通常是「未分组」），用户看到的就是「删了又冒出来」。
+   *    这类 id 保持归档隐藏；启动对账会清掉已不存在会话的归档条目。 */
   if (failures.length === 0) {
     for (const id of idList) {
       try {
         await deps.registry.unpinSession(id)
       } catch {
         /* 未置顶时不做任何事 */
+      }
+      let stillLive = false
+      try {
+        stillLive = deps.sessions.get(id) !== undefined
+      } catch {
+        stillLive = false
+      }
+      if (stillLive) {
+        warnings.push(`kept archived (session still live in memory): ${id}`)
+        continue
       }
       try {
         /* 已归档 id 若保留，会一直膨胀 durable 集合；文件已删干净，这里顺手移除。 */
@@ -687,6 +700,88 @@ export default {
         sendJson(res, 200, { ok: true, version: VERSION, artifactDirname: ARTIFACT_DIRNAME })
       },
     }), 'dsh-session-delete: ping route')
+
+    /* 只读诊断：用于排查「删除后侧栏又冒出幽灵会话」这类客户端/宿主状态不一致。 */
+    ctx.effect(() => ctx.webServer.register({
+      kind: 'exact',
+      path: '/dsh-session-delete/diag',
+      handler: async (req, res) => {
+        const live = []
+        try {
+          const agents = ctx.get('agents')
+          for (const session of deps.sessions.list()) {
+            let projections
+            try {
+              projections = ctx.sessionProjections?.cachedSnapshot?.(session)?.values
+            } catch {
+              projections = undefined
+            }
+            live.push({
+              id: session.id,
+              cwd: session.header?.cwd ?? null,
+              createdAt: session.header?.createdAt ?? null,
+              isSeeded: session.header?.isSeeded ?? null,
+              origin: session.header?.origin ?? null,
+              parentSession: session.header?.parentSession ?? null,
+              seq: session.seq,
+              title: projections?.title ?? null,
+              blank: projections?.sessionListMetadata?.blank ?? null,
+              lastPromptAt: projections?.sessionListMetadata?.lastPromptAt ?? null,
+              agentStatus: agents?.get?.(session.id)?.status ?? null,
+              inheritedEventCount: session.inheritedEventCount ?? null,
+              firstUserMessage: (() => {
+                try {
+                  const events = session.snapshotEvents()
+                  const message = events.find((event) => event.type === 'user/message')
+                  const content = message?.data?.message?.content
+                  const raw = typeof content === 'string' ? content : JSON.stringify(content ?? null)
+                  return raw === undefined ? null : raw.slice(0, 160)
+                } catch {
+                  return null
+                }
+              })(),
+            })
+          }
+        } catch {
+          /* ignore */
+        }
+        const workspaces = []
+        try {
+          for (const workspace of deps.registry.list()) {
+            workspaces.push({ id: workspace.id, path: workspace.path, sessionIds: workspace.sessionIds })
+          }
+        } catch {
+          /* ignore */
+        }
+        let queryList = null
+        try {
+          const query = ctx.get('sessionQuery')
+          if (query !== undefined && query !== null && typeof query.listSessions === 'function') {
+            const records = await query.listSessions()
+            queryList = records.map((record) => ({
+              id: record.header?.id,
+              cwd: record.header?.cwd ?? null,
+              createdAt: record.header?.createdAt ?? null,
+              parentSession: record.header?.parentSession ?? null,
+              origin: record.header?.origin ?? null,
+              live: record.live === true,
+              persisted: record.persisted === true,
+            }))
+          }
+        } catch {
+          /* ignore */
+        }
+        sendJson(res, 200, {
+          ok: true,
+          version: VERSION,
+          live,
+          workspaces,
+          archived: deps.registry.archivedSessionIds,
+          pinned: deps.registry.pinnedSessionIds,
+          queryList,
+        })
+      },
+    }), 'dsh-session-delete: diag route')
 
     ctx.effect(() => ctx.on('agent/created', async ({ agent }) => {
       try {

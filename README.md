@@ -31,6 +31,11 @@
 删除是幂等的：只有投影缓存残留的幽灵会话、甚至完全不存在的 id，都返回成功而不是
 `missing`；物理删除失败时会回滚归档，让会话恢复可见而不是灰着不放。
 
+删除完成后，如果该会话**仍 live 在宿主内存里**（只存在于内存、没落到磁盘的会话，
+或视图还没释放的会话），插件会**保持归档隐藏**而不是取消归档 —— 否则宿主的 session
+列表会让它重新出现在侧栏（典型表现：删掉后「未分组」又冒出一行）。等该会话被释放
+或 DSH 重启后，启动对账会自动清掉归档条目。
+
 ## 每个对话一个编号目录
 
 会话 id 就是编号，shell 里可通过 `DSH_SESSION_ID` 读取（PowerShell
@@ -50,7 +55,11 @@
 
 ## 版本历史
 
-- **0.4.1（当前）**：修复「会话只是被打开着、没有任务，却报『仍在运行，未能停止』」。
+- **0.4.5（当前）**：修复「删掉后侧栏又冒出一行（例如未分组的『问候』）」。原因：被删
+  会话如果仍 live 在宿主内存里，宿主 session 列表仍会返回它，而旧版删除成功后统一
+  `unarchive`，于是它又以「未分组」行出现。现在仍 live 的会话删除后保持归档隐藏，
+  不再复活；`/diag` 提供 live/workspace/queryList 只读诊断。
+- **0.4.1**：修复「会话只是被打开着、没有任务，却报『仍在运行，未能停止』」。
   旧版把 DSH 中仍 attach 的 live Session 当成必须等它退出，5 秒等不到就中止并留下
   已归档的灰行；现在 flush 失败只记警告、最多等 1.5 秒就继续删除，物理删除失败时才
   回滚归档。`GET /ping` 改为只读、不设栅栏，便于排障。
@@ -95,6 +104,7 @@ dsh plugin --profile desktop remove dsh-session-delete
 |---|---|
 | `POST /dsh-session-delete/delete` | `{ sessionId }` → 删除；最多 64 KiB JSON；有认证/Host-Origin 栅栏 |
 | `GET /dsh-session-delete/ping` | 只读健康检查：`{ ok: true, version }`（不设栅栏，便于排障） |
+| `GET /dsh-session-delete/diag` | 只读诊断：live 会话 / 工作区账目 / sessionQuery 列表（不设栅栏） |
 
 删除顺序（有意设计）：
 
@@ -108,7 +118,8 @@ dsh plugin --profile desktop remove dsh-session-delete
    必须赶在删文件之前）；
 6. 删除日志目录（`persistence.locate()` 精确路径 + 扫描会话根兜底）、投影缓存、
    `.dsh-sessions/<id>/` 产出目录；
-7. 全部成功：`unpinSession` / `unarchiveSession` 清理账目；
+7. 全部成功：`unpinSession` 清理置顶；**仅对已不再 live 的会话** `unarchiveSession`
+   清理归档集合（仍 live 的保持归档隐藏，避免侧栏复活）；
    有失败：把临时归档的会话 `unarchive` 回滚成可见，返回失败详情供重试。
 
 启动时做一次轻量对账：清掉已不存在会话的归档 id 与孤立投影缓存。

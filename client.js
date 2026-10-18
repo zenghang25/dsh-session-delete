@@ -1,5 +1,5 @@
 /**
- * dsh-session-delete v0.4.1 — 会话删除（Client 半）
+ * dsh-session-delete v0.4.5 — 会话删除（Client 半）
  *
  * 只做一件事：在会话行的「⋯」菜单里注册一个「删除会话」项，点击后直接删除，不弹确认框。
  *
@@ -205,7 +205,7 @@ window.__ModuleLoader__.load({
 				};
 			}, 'dsh-session-delete: client cleanup');
 
-			console.log('[dsh-session-delete] client ready v0.4.1, lang=' + localeId);
+			console.log('[dsh-session-delete] client ready v0.4.5, lang=' + localeId);
 		}
 
 		exports.apply = apply;
