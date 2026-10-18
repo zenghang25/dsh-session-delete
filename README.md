@@ -14,16 +14,20 @@
 
 | 入口 | 菜单项 | 行为 |
 |---|---|---|
-| 会话行 `⋯` 菜单（末位，分隔线 + 红色危险样式） | **删除会话** | 一键永久删除该会话及其本地记录，无确认弹窗 |
+| 会话行 `⋯` 菜单（末位，分隔线 + 红色危险样式） | **删除会话** | 一键删除该会话，无确认弹窗；日志与产出目录进 Windows 回收站，可还原 |
 
-一次点击清空以下内容：
+一次点击处理以下内容：
 
-| 内容 | 路径 |
+| 内容 | 去向 |
 |---|---|
-| 会话日志（含子代理子会话） | `~/.dsh/sessions/<项目>/<session-id>/` |
-| 投影缓存 | `~/.dsh/storages/session_projcache/sessions/<session-id>.json` |
-| 该对话的产出目录 | `<会话工作目录>/.dsh-sessions/<session-id>/` |
+| 会话日志（含子代理子会话） | **Windows 回收站**（`~/.dsh/sessions/<项目>/<session-id>/` 可还原） |
+| 该对话的产出目录 | **Windows 回收站**（`<会话工作目录>/.dsh-sessions/<session-id>/` 可还原） |
+| 投影缓存 | 永久删除（可再生缓存，`~/.dsh/storages/session_projcache/sessions/<session-id>.json`） |
 | 工作区账目 / 置顶 / 归档集合 | `detachSession`、`unpinSession`、`unarchiveSession` |
+
+> 回收站还原：删完后打开 Windows 回收站，找到名为该会话 id 的目录 → 还原。
+> 日志回到原路径后，去 DSH 的「已归档」/「未分组」里点「取消归档」或重新打开即可。
+> 投影缓存不会进回收站（它只是缓存，会重新生成）；非 Windows 平台回退为永久删除并记录警告。
 
 运行中的会话会先被安全停止：写归档集合（`agent/pre-step` 门禁）→ `sessions.flush`
 持久化屏障 → 短暂等待 live 会话关闭视图 → **然后无条件继续删除**。
@@ -55,7 +59,10 @@
 
 ## 版本历史
 
-- **0.4.6（当前）**：删除后**侧栏一定不再出现这一行**，即使宿主仍把 live 会话留在内存里：
+- **0.5.0（当前）**：删除改为**可还原**。会话日志目录与 `.dsh-sessions/<id>` 产出目录改成经
+  `SHFileOperationW`（`FOF_ALLOWUNDO`）移入 **Windows 回收站**，可以从回收站还原；
+  投影缓存仍永久删除（可再生）。仍然是一键直删、无确认弹窗。非 Windows 平台回退为永久删除。
+- **0.4.6**：删除后**侧栏一定不再出现这一行**，即使宿主仍把 live 会话留在内存里：
   - 客户端记住已删除的会话 id（localStorage），用 CSS 直接隐藏对应行，刷新列表后再摘一次；
   - 删除成功后调用官方 `workspaces.archiveSession` 同步客户端归档集合；
   - 启动时按 `/diag` 自动清理旧版本残留的「已归档 + live + 无落盘」幽灵行。
@@ -70,7 +77,8 @@
 - **0.4.0**：合并路线。保留 0.2.0 的一键直删、删除范围与每对话产出目录；
   并入 0.3.0 的 Host 安全设计（`connection.requestRejection` 认证/Host-Origin 栅栏、
   64 KiB 请求体上限、live 会话的 `sessions.flush` 持久化屏障）。
-  按用户要求**去掉 0.3.0 的确认弹窗和回收站流程**，改为直接删除。
+  按用户要求**去掉 0.3.0 的确认弹窗和回收站流程**，改为直接删除
+  （0.5.0 又按用户要求把回收站加回来，但仍然没有确认弹窗）。
 - **0.3.0**：确认弹窗 + 移到 Windows 回收站的版本（已废弃，见 git 历史）。
 - **0.2.0**：重写。修复「点击删除永远报 missing」（旧代码从 `persistence.list()` 快照
   的错误层级读 id）；菜单从 MutationObserver 克隆 DOM 改为官方 slot 注册。
@@ -120,8 +128,8 @@ dsh plugin --profile desktop remove dsh-session-delete
 4. 最多等 1.5 秒让 live 会话自然退出；超时也继续删，不再返回 `active`；
 5. 先 `detachSession`（`workspace.sessionIds` getter 会按会话是否仍存在过滤，
    必须赶在删文件之前）；
-6. 删除日志目录（`persistence.locate()` 精确路径 + 扫描会话根兜底）、投影缓存、
-   `.dsh-sessions/<id>/` 产出目录；
+6. 把日志目录（`persistence.locate()` 精确路径 + 扫描会话根兜底）和 `.dsh-sessions/<id>/`
+   产出目录移入 Windows 回收站；投影缓存永久删除；
 7. 全部成功：`unpinSession` 清理置顶；**仅对已不再 live 的会话** `unarchiveSession`
    清理归档集合（仍 live 的保持归档隐藏，避免侧栏复活）；
    有失败：把临时归档的会话 `unarchive` 回滚成可见，返回失败详情供重试。
@@ -133,7 +141,8 @@ dsh plugin --profile desktop remove dsh-session-delete
 - 只删该会话自己的日志目录 / 投影缓存 / 产出目录：id 白名单、路径必须位于会话根或
   由持久化 header 的 cwd 构造；`rmrf` 拒绝根目录式路径。
 - 附件对象（`~/.dsh/attachments/v1/objects/…`）是内容寻址共享资源，不随会话删除。
-- **删除是永久的，不可恢复**（0.3.0 的回收站行为已移除）。
+- **日志目录与产出目录进 Windows 回收站，可还原**；投影缓存是可再生的，永久删除。
+  非 Windows 平台没有回收站支持，回退为永久删除并在响应里记警告。
 - 文件删除带重试；若最终仍失败会返回失败详情（已删部分不回滚，重试即可收尾）。
 - cost-meter 账本不清理。
 

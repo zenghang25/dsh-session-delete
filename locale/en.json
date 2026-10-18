@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Delete Session",
-    "description": "Adds a one-click Delete session row to the sidebar session menu: permanently removes the session logs, projection cache and its .dsh-sessions/<session-id>/ artifact directory after stopping running work."
+    "description": "Adds a one-click Delete session row to the sidebar session menu: moves the session log and its .dsh-sessions/<session-id>/ artifact directory to the Windows Recycle Bin, with no confirmation dialog."
   }
 }

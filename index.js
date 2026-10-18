@@ -27,16 +27,73 @@
  *
  * 依赖服务（inject）：webServer、sessionPersistence、workspaceRegistry、sessions。
  */
+import { execFile } from 'node:child_process'
 import { promises as fsp } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
+import { promisify } from 'node:util'
 
 const MODULE = '[dsh-session-delete]'
-const VERSION = '0.4.6'
+const VERSION = '0.5.0'
 /** 会话产出目录名：放在工作目录下，与工作区内容区分。 */
 const ARTIFACT_DIRNAME = '.dsh-sessions'
 /** 请求体上限：唯一合法的请求体就是一个小对象。 */
 const MAX_BODY_BYTES = 64 * 1024
+/** 移到回收站允许的最长时间（PowerShell 启动 + SHFileOperation）。 */
+const TRASH_TIMEOUT_MS = 30_000
+const execFileAsync = promisify(execFile)
+/**
+ * 用 shell 自己的删除通道（SHFileOperationW + FOF_ALLOWUNDO）把目录移入 Windows 回收站。
+ * 目标路径通过环境变量传入，不拼进命令行；脚本用 -EncodedCommand（UTF-16LE Base64）
+ * 传递，不依赖 PowerShell 执行策略，也不会弹控制台窗口。
+ */
+const RECYCLE_SCRIPT = String.raw`
+$ErrorActionPreference = 'Stop'
+$target = $env:DSH_SESSION_DELETE_TARGET
+if ([string]::IsNullOrWhiteSpace($target)) {
+  [Console]::Error.WriteLine('dsh-session-delete: missing target')
+  exit 2
+}
+if (-not (Test-Path -LiteralPath $target)) { exit 0 }
+$source = @"
+using System;
+using System.Runtime.InteropServices;
+
+public static class DshSessionDeleteRecycle {
+  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+  private struct SHFILEOPSTRUCTW {
+    public IntPtr hwnd;
+    public uint wFunc;
+    [MarshalAs(UnmanagedType.LPWStr)] public string pFrom;
+    [MarshalAs(UnmanagedType.LPWStr)] public string pTo;
+    public ushort fFlags;
+    [MarshalAs(UnmanagedType.Bool)] public bool fAnyOperationsAborted;
+    public IntPtr hNameMappings;
+    [MarshalAs(UnmanagedType.LPWStr)] public string lpszProgressTitle;
+  }
+
+  [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  private static extern int SHFileOperationW(ref SHFILEOPSTRUCTW lpFileOp);
+
+  public static int MoveToRecycleBin(string path) {
+    SHFILEOPSTRUCTW operation = new SHFILEOPSTRUCTW();
+    operation.wFunc = 3; // FO_DELETE
+    operation.pFrom = path + "\0";
+    operation.fFlags = 0x0040 | 0x0010 | 0x0004 | 0x0400; // ALLOWUNDO | NOCONFIRMATION | SILENT | NOERRORUI
+    int result = SHFileOperationW(ref operation);
+    if (operation.fAnyOperationsAborted) return result == 0 ? 0x04C7 : result;
+    return result;
+  }
+}
+"@
+Add-Type -TypeDefinition $source -Language CSharp
+$result = [DshSessionDeleteRecycle]::MoveToRecycleBin($target)
+if ($result -ne 0) {
+  [Console]::Error.WriteLine(('dsh-session-delete: SHFileOperationW failed 0x{0:X8}' -f $result))
+  exit 1
+}
+exit 0
+`
 /** 会话 id 只允许路径安全字符；真实 id 形如 session-<uuid>。 */
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,240}$/
 /** 系统提示词段位置：工具段之后、结构化输出之前。 */
@@ -127,6 +184,42 @@ async function readJson(target) {
     return JSON.parse(await fsp.readFile(target, 'utf8'))
   } catch {
     return undefined
+  }
+}
+
+/**
+ * 把一个目录移到 Windows 回收站（可还原）。非 Windows 或 shell 失败时返回 `{ok:false}`，
+ * 由调用方决定是否回滚；不会抛异常。
+ * @returns `{ ok: true }` 或 `{ ok:false, code, detail }`
+ */
+async function trashDirectory(target) {
+  if (process.platform !== 'win32') {
+    return {
+      ok: false,
+      code: 'trash-unsupported',
+      detail: `Recycle Bin move is implemented for Windows only (this host runs on ${process.platform}).`,
+    }
+  }
+  const encoded = Buffer.from(RECYCLE_SCRIPT, 'utf16le').toString('base64')
+  try {
+    await execFileAsync(
+      'powershell.exe',
+      ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded],
+      {
+        env: { ...process.env, DSH_SESSION_DELETE_TARGET: target },
+        windowsHide: true,
+        timeout: TRASH_TIMEOUT_MS,
+        maxBuffer: 64 * 1024,
+      },
+    )
+    return { ok: true }
+  } catch (error) {
+    const detail = [error !== null && error !== undefined ? error.stderr : undefined, error !== null && error !== undefined ? error.stdout : undefined, textOf(error)]
+      .map(textOf)
+      .filter((part) => part !== '')
+      .join('\n')
+      .trim()
+    return { ok: false, code: 'trash-failed', detail: detail.slice(0, 2000) }
   }
 }
 
@@ -241,6 +334,19 @@ function collectDescendants(headers, rootId) {
 async function deleteSession(deps, rootId) {
   const warnings = []
   const remove = typeof deps.remove === 'function' ? deps.remove : rmrf
+  /* 会话日志与产出目录走回收站（可还原）；投影缓存是可再生的缓存，永久删除即可。 */
+  const recycle = typeof deps.recycle === 'function' ? deps.recycle : undefined
+  const recycled = []
+  async function recycleOrRemove(target, codeFallback) {
+    if (recycle === undefined) {
+      warnings.push(`recycle-unavailable: removing ${target} permanently`)
+      const removed = await remove(target)
+      return removed.ok ? { ok: true } : { ok: false, code: codeFallback, detail: textOf(removed.error !== null && removed.error !== undefined && removed.error.message) }
+    }
+    const result = await recycle(target)
+    if (result.ok) recycled.push(target)
+    return result
+  }
   const headers = await collectHeaders(deps)
   if (!headers.has(rootId)) {
     const header = await headerOf(deps, rootId)
@@ -370,11 +476,11 @@ async function deleteSession(deps, rootId) {
       warnings.push(`skip outside sessions root: ${dir}`)
       continue
     }
-    const result = await remove(dir)
-    if (!result.ok) failures.push({ path: dir, error: textOf(result.error !== null && result.error !== undefined && result.error.message) })
+    const result = await recycleOrRemove(dir, 'rm-failed')
+    if (!result.ok) failures.push({ path: dir, code: result.code ?? 'trash-failed', error: textOf(result.detail ?? (result.error !== null && result.error !== undefined ? result.error.message : '')) })
   }
 
-  /* 6) 删投影缓存。 */
+  /* 6) 删投影缓存（可再生缓存：永久删除，不进回收站）。 */
   for (const id of idList) {
     if (!isSafeId(id)) continue
     const cache = projCachePath(id)
@@ -383,15 +489,15 @@ async function deleteSession(deps, rootId) {
     if (!result.ok) failures.push({ path: cache, error: textOf(result.error !== null && result.error !== undefined && result.error.message) })
   }
 
-  /* 7) 删该对话的产出目录（每个会话/子会话各自一个编号目录）。 */
+  /* 7) 该对话的产出目录（每个会话/子会话各自一个编号目录）→ 回收站，可还原。 */
   for (const id of idList) {
     const header = headers.get(id)
     const cwd = header !== null && header !== undefined ? header.cwd : undefined
     if (typeof cwd !== 'string' || cwd === '' || !isAbsolute(cwd)) continue
     const artifactDir = artifactDirFor(cwd, id)
     if (!(await pathExists(artifactDir))) continue
-    const result = await remove(artifactDir)
-    if (!result.ok) failures.push({ path: artifactDir, error: textOf(result.error !== null && result.error !== undefined && result.error.message) })
+    const result = await recycleOrRemove(artifactDir, 'rm-failed')
+    if (!result.ok) failures.push({ path: artifactDir, code: result.code ?? 'trash-failed', error: textOf(result.detail ?? (result.error !== null && result.error !== undefined ? result.error.message : '')) })
   }
 
   /* 8) 清理置顶/归档账目。
@@ -434,7 +540,7 @@ async function deleteSession(deps, rootId) {
     }
   }
 
-  return { ok: failures.length === 0, deleted: idList, failures, warnings }
+  return { ok: failures.length === 0, deleted: idList, recycled, failures, warnings }
 }
 
 /** 启动对账：清掉已不存在会话的归档条目与孤立投影缓存（不碰任何真实数据）。 */
@@ -626,11 +732,13 @@ function sendJson(res, status, value) {
 export default {
   name: 'dsh-session-delete',
   inject: ['webServer', 'connection', 'sessionPersistence', 'workspaceRegistry', 'sessions'],
-  apply(ctx) {
+  apply(ctx, config = {}) {
     const deps = {
       persistence: ctx.sessionPersistence,
       registry: ctx.workspaceRegistry,
       sessions: ctx.sessions,
+      /* Windows 上把日志目录/产出目录移到回收站；测试可以通过 row config 注入替代实现。 */
+      recycle: typeof config?.recycle === 'function' ? config.recycle : process.platform === 'win32' ? trashDirectory : undefined,
     }
 
     /**
@@ -678,17 +786,18 @@ export default {
         }
         if (!result.ok) {
           log('delete incomplete for', body.sessionId, result.failures)
+          const firstFailure = result.failures[0] ?? {}
           sendJson(res, 500, {
             ok: false,
-            code: result.code ?? 'remove-failed',
-            detail: (result.failures[0] ?? {}).error ?? '',
+            code: firstFailure.code ?? result.code ?? 'remove-failed',
+            detail: firstFailure.error ?? '',
             failures: result.failures,
             warnings: result.warnings,
           })
           return
         }
         if (result.warnings.length > 0) log('delete warnings for', body.sessionId, result.warnings)
-        sendJson(res, 200, { ok: true, deleted: result.deleted, warnings: result.warnings })
+        sendJson(res, 200, { ok: true, deleted: result.deleted, recycled: result.recycled, warnings: result.warnings })
       },
     }), 'dsh-session-delete: delete route')
 
@@ -807,6 +916,7 @@ export const __internals = {
   VERSION,
   ARTIFACT_DIRNAME,
   deleteSession,
+  trashDirectory,
   reconcile,
   collectHeaders,
   headerOf,

@@ -1,5 +1,5 @@
 /**
- * dsh-session-delete v0.4.6 — 会话删除（Client 半）
+ * dsh-session-delete v0.5.0 — 会话删除（Client 半）
  *
  * 只做一件事：在会话行的「⋯」菜单里注册一个「删除会话」项，点击后直接删除，不弹确认框。
  *
@@ -24,14 +24,14 @@ window.__ModuleLoader__.load({
 		var DICT = {
 			zh: {
 				deleteSession: '删除会话',
-				deleted: '已删除会话',
+				deleted: '已删除，可在回收站还原',
 				failed: '删除失败',
 				active: '删除失败：会话仍在运行，未能停止，请稍后重试',
 				network: '删除失败：无法连接 DSH 服务',
 			},
 			en: {
 				deleteSession: 'Delete session',
-				deleted: 'Session deleted',
+				deleted: 'Deleted — recoverable from the Recycle Bin',
 				failed: 'Delete failed',
 				active: 'Delete failed: the session is still running and could not be stopped; retry later',
 				network: 'Delete failed: DSH service unreachable',
@@ -290,7 +290,7 @@ window.__ModuleLoader__.load({
 				};
 			}, 'dsh-session-delete: client cleanup');
 
-			console.log('[dsh-session-delete] client ready v0.4.6, lang=' + localeId);
+			console.log('[dsh-session-delete] client ready v0.5.0, lang=' + localeId);
 		}
 
 		exports.apply = apply;

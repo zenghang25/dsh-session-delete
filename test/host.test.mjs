@@ -47,7 +47,16 @@ function makeHarness(state) {
   const routes = new Map()
   const listeners = new Map()
   const disposers = []
-  const calls = { archive: [], unarchive: [], unpin: [], detach: [] }
+  const calls = { archive: [], unarchive: [], unpin: [], detach: [], recycled: [] }
+
+  /* 回收站替身：记录被移入回收站的路径并模拟“移走”（真正删除临时目录）。
+   * 测试里绝不能碰真实回收站。 */
+  const recycle = async (target) => {
+    calls.recycled.push(target)
+    if (state.recycleFails === true) return { ok: false, code: 'trash-failed', detail: 'SHFileOperationW failed 0x00000001' }
+    await fsp.rm(target, { recursive: true, force: true })
+    return { ok: true }
+  }
 
   const workspace = {
     sessionIds: [...(state.attached ?? [])],
@@ -123,7 +132,7 @@ function makeHarness(state) {
     },
   }
 
-  plugin.apply(ctx)
+  plugin.apply(ctx, { recycle })
   return { ctx, routes, listeners, disposers, calls, workspace }
 }
 
@@ -187,8 +196,11 @@ try {
     assert.equal(res.payload.ok, true)
     assert.deepEqual(res.payload.deleted.sort(), ['session-child', 'session-parent'])
 
-    assert.equal(await exists(join(home, 'sessions', '--proj--', 'session-parent')), false, '父会话日志目录已删')
-    assert.equal(await exists(join(home, 'sessions', '--proj--', 'session-child')), false, '子会话日志目录已删')
+    assert.equal(await exists(join(home, 'sessions', '--proj--', 'session-parent')), false, '父会话日志目录已移走')
+    assert.equal(await exists(join(home, 'sessions', '--proj--', 'session-child')), false, '子会话日志目录已移走')
+    assert.ok(harness.calls.recycled.some((target) => target.endsWith('session-parent')), '父会话日志进了回收站')
+    assert.ok(harness.calls.recycled.some((target) => target.endsWith('session-child')), '子会话日志进了回收站')
+    assert.ok(harness.calls.recycled.some((target) => target.includes('.dsh-sessions')), '产出目录进了回收站')
     assert.equal(await exists(join(home, 'storages', 'session_projcache', 'sessions', 'session-parent.json')), false, '父会话投影缓存已删')
     assert.equal(await exists(join(home, 'storages', 'session_projcache', 'sessions', 'session-child.json')), false, '子会话投影缓存已删')
     assert.equal(await exists(join(cwd, '.dsh-sessions', 'session-parent')), false, '父会话产出目录已删')
@@ -251,6 +263,19 @@ try {
     assert.ok(harness.calls.archive.some((entry) => entry.id === 'session-archived' && entry.stop === true), '随后带 stopActivity 归档')
     assert.deepEqual(state.archived, [], '归档集合已清理')
     assert.equal(await exists(join(home, 'sessions', '--proj--', 'session-archived')), false)
+  })
+
+  await test('移入回收站失败：报错并回滚归档，会话恢复可见', async () => {
+    const state = { headers: {}, live: {}, archived: [], attached: [], recycleFails: true }
+    const cwd = join(workspaceRoot, 'case-trash-fail')
+    await seedSession(state, { id: 'session-trashfail', cwd })
+    const harness = makeHarness(state)
+    const res = await callRoute(harness.routes, '/dsh-session-delete/delete', { sessionId: 'session-trashfail' })
+    assert.equal(res.status, 500)
+    assert.equal(res.payload.code, 'trash-failed')
+    assert.ok(harness.calls.unarchive.includes('session-trashfail'), '失败后回滚归档，恢复可见')
+    assert.deepEqual(state.archived, [])
+    assert.equal(await exists(join(home, 'sessions', '--proj--', 'session-trashfail')), true, '日志保留，可重试')
   })
 
   await test('会话一直 live（只是被打开着、没有任务）：照样删除成功，不再 409', async () => {
@@ -401,7 +426,7 @@ try {
     const res = await callRoute(harness.routes, '/dsh-session-delete/ping', {})
     assert.equal(res.status, 200)
     assert.equal(res.payload.ok, true)
-    assert.equal(res.payload.version, '0.4.6')
+    assert.equal(res.payload.version, '0.5.0')
   })
 } finally {
   await fsp.rm(testRoot, { recursive: true, force: true, maxRetries: 3 })
