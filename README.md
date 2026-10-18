@@ -26,9 +26,10 @@
 | 工作区账目 / 置顶 / 归档集合 | `detachSession`、`unpinSession`、`unarchiveSession` |
 
 运行中的会话会先被安全停止：写归档集合（`agent/pre-step` 门禁）→ `sessions.flush`
-持久化屏障 → 等待 live 会话关闭视图 → 再动文件。无法停止时返回 `409 active`，
-**一个文件都不动**。删除是幂等的：只有投影缓存残留的幽灵会话、甚至完全不存在的 id，
-都返回成功而不是 `missing`。
+持久化屏障 → 短暂等待 live 会话关闭视图 → **然后无条件继续删除**。
+不会因为「会话仍处于打开状态」而拒绝删除（0.4.1 起；旧版会误报 `409 active`）。
+删除是幂等的：只有投影缓存残留的幽灵会话、甚至完全不存在的 id，都返回成功而不是
+`missing`；物理删除失败时会回滚归档，让会话恢复可见而不是灰着不放。
 
 ## 每个对话一个编号目录
 
@@ -49,7 +50,11 @@
 
 ## 版本历史
 
-- **0.4.0（当前）**：合并路线。保留 0.2.0 的一键直删、删除范围与每对话产出目录；
+- **0.4.1（当前）**：修复「会话只是被打开着、没有任务，却报『仍在运行，未能停止』」。
+  旧版把 DSH 中仍 attach 的 live Session 当成必须等它退出，5 秒等不到就中止并留下
+  已归档的灰行；现在 flush 失败只记警告、最多等 1.5 秒就继续删除，物理删除失败时才
+  回滚归档。`GET /ping` 改为只读、不设栅栏，便于排障。
+- **0.4.0**：合并路线。保留 0.2.0 的一键直删、删除范围与每对话产出目录；
   并入 0.3.0 的 Host 安全设计（`connection.requestRejection` 认证/Host-Origin 栅栏、
   64 KiB 请求体上限、live 会话的 `sessions.flush` 持久化屏障）。
   按用户要求**去掉 0.3.0 的确认弹窗和回收站流程**，改为直接删除。
@@ -88,10 +93,8 @@ dsh plugin --profile desktop remove dsh-session-delete
 
 | 路由 | 作用 |
 |---|---|
-| `POST /dsh-session-delete/delete` | `{ sessionId }` → 删除；最多 64 KiB JSON |
-| `GET /dsh-session-delete/ping` | 健康检查：`{ ok: true, version }` |
-
-两个路由都先过 `ctx.connection.requestRejection(req)`（浏览器认证 + Host/Origin 栅栏）。
+| `POST /dsh-session-delete/delete` | `{ sessionId }` → 删除；最多 64 KiB JSON；有认证/Host-Origin 栅栏 |
+| `GET /dsh-session-delete/ping` | 只读健康检查：`{ ok: true, version }`（不设栅栏，便于排障） |
 
 删除顺序（有意设计）：
 
@@ -99,13 +102,14 @@ dsh plugin --profile desktop remove dsh-session-delete
    并沿 `parentSession` 收集子代理子会话；
 2. `archiveSession(id, { stopActivity: true })`：durable 归档集合是 `agent/pre-step`
    门禁，先写它再停工作；已归档的会话先 `unarchive` 再归档，确保停止逻辑真的执行；
-3. live 会话 `sessions.flush(session)`，失败则中止（不冒损坏日志风险）；
-4. 等 live 会话退出；仍有 live 会话则返回 `active`，不删文件；
+3. live 会话 `sessions.flush(session)`；失败只记警告，不再中止删除；
+4. 最多等 1.5 秒让 live 会话自然退出；超时也继续删，不再返回 `active`；
 5. 先 `detachSession`（`workspace.sessionIds` getter 会按会话是否仍存在过滤，
    必须赶在删文件之前）；
 6. 删除日志目录（`persistence.locate()` 精确路径 + 扫描会话根兜底）、投影缓存、
    `.dsh-sessions/<id>/` 产出目录；
-7. `unpinSession` / `unarchiveSession` 清理账目。
+7. 全部成功：`unpinSession` / `unarchiveSession` 清理账目；
+   有失败：把临时归档的会话 `unarchive` 回滚成可见，返回失败详情供重试。
 
 启动时做一次轻量对账：清掉已不存在会话的归档 id 与孤立投影缓存。
 
@@ -126,7 +130,7 @@ node test\client.test.mjs   # 迷你 React/slot runtime，驱动真实注册组�
 ```
 
 覆盖：认证栅栏、方法/参数校验、正常删除、子会话、幽灵会话、已归档会话、live 会话
-flush 与无法停止时的中止、产出目录、启动对账、ping。
+（含一直不退出/flush 失败也照删）、删除失败回滚归档、产出目录、启动对账、ping。
 
 ## 已知限制
 

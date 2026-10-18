@@ -253,7 +253,7 @@ try {
     assert.equal(await exists(join(home, 'sessions', '--proj--', 'session-archived')), false)
   })
 
-  await test('live 会话无法停止时：返回 active，且不删任何文件', async () => {
+  await test('会话一直 live（只是被打开着、没有任务）：照样删除成功，不再 409', async () => {
     const state = { headers: {}, live: {}, archived: [], attached: [] }
     const cwd = join(workspaceRoot, 'case-stuck')
     const header = await seedSession(state, { id: 'session-stuck', cwd })
@@ -261,11 +261,31 @@ try {
     const harness = makeHarness(state)
 
     const res = await callRoute(harness.routes, '/dsh-session-delete/delete', { sessionId: 'session-stuck' })
-    assert.equal(res.status, 409)
-    assert.equal(res.payload.ok, false)
-    assert.equal(res.payload.code, 'active')
-    assert.equal(await exists(join(home, 'sessions', '--proj--', 'session-stuck')), true, '日志目录未被删除')
-    assert.equal(await exists(join(cwd, '.dsh-sessions', 'session-stuck')), true, '产出目录未被删除')
+    assert.equal(res.status, 200)
+    assert.equal(res.payload.ok, true)
+    assert.deepEqual(res.payload.deleted, ['session-stuck'])
+    assert.ok(harness.calls.archive.some((entry) => entry.id === 'session-stuck' && entry.stop === true), '先归档停写')
+    assert.equal(await exists(join(home, 'sessions', '--proj--', 'session-stuck')), false, '日志目录已删除')
+    assert.equal(await exists(join(cwd, '.dsh-sessions', 'session-stuck')), false, '产出目录已删除')
+  })
+
+  await test('物理删除失败：回滚归档，让会话恢复可见而不是灰着不放', async () => {
+    const state = { headers: {}, live: {}, archived: [], attached: [] }
+    const cwd = join(workspaceRoot, 'case-rollback')
+    await seedSession(state, { id: 'session-rollback', cwd })
+    const harness = makeHarness(state)
+    const deps = {
+      persistence: harness.ctx.sessionPersistence,
+      registry: harness.ctx.workspaceRegistry,
+      sessions: harness.ctx.sessions,
+      remove: async () => ({ ok: false, error: new Error('locked') }),
+    }
+    const result = await internals.deleteSession(deps, 'session-rollback')
+    assert.equal(result.ok, false)
+    assert.ok(harness.calls.archive.some((entry) => entry.id === 'session-rollback' && entry.stop === true))
+    assert.ok(harness.calls.unarchive.includes('session-rollback'), '失败后取消归档，恢复可见')
+    assert.deepEqual(state.archived, [])
+    assert.equal(await exists(join(home, 'sessions', '--proj--', 'session-rollback')), true, '文件保留，可以重试')
   })
 
   await test('非法 id 与空请求：400 bad-args，不碰任何文件', async () => {
@@ -360,17 +380,18 @@ try {
     assert.deepEqual(res.payload, { ok: false, code: 'method-not-allowed' })
   })
 
-  await test('live flush 失败：中止删除，一个文件都不动', async () => {
+  await test('live flush 失败：只记警告，仍然继续删除', async () => {
     const state = { headers: {}, live: {}, archived: [], attached: [], flushError: new Error('disk full') }
     const cwd = join(workspaceRoot, 'case-flush')
     const header = await seedSession(state, { id: 'session-flush', cwd })
     state.live['session-flush'] = { header, polls: 0, disappearAfter: 999 }
     const harness = makeHarness(state)
     const res = await callRoute(harness.routes, '/dsh-session-delete/delete', { sessionId: 'session-flush' })
-    assert.equal(res.status, 500)
-    assert.equal(res.payload.code, 'flush-failed')
-    assert.equal(await exists(join(home, 'sessions', '--proj--', 'session-flush')), true, '日志仍在')
-    assert.equal(await exists(join(cwd, '.dsh-sessions', 'session-flush')), true, '产出目录仍在')
+    assert.equal(res.status, 200)
+    assert.equal(res.payload.ok, true)
+    assert.ok((res.payload.warnings ?? []).some((warning) => String(warning).includes('flush')), '记录 flush 警告')
+    assert.equal(await exists(join(home, 'sessions', '--proj--', 'session-flush')), false, '日志已删除')
+    assert.equal(await exists(join(cwd, '.dsh-sessions', 'session-flush')), false, '产出目录已删除')
   })
 
   await test('ping 路由报告版本', async () => {
@@ -378,7 +399,7 @@ try {
     const res = await callRoute(harness.routes, '/dsh-session-delete/ping', {})
     assert.equal(res.status, 200)
     assert.equal(res.payload.ok, true)
-    assert.equal(res.payload.version, '0.4.0')
+    assert.equal(res.payload.version, '0.4.1')
   })
 } finally {
   await fsp.rm(testRoot, { recursive: true, force: true, maxRetries: 3 })

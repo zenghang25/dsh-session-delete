@@ -32,7 +32,7 @@ import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 
 const MODULE = '[dsh-session-delete]'
-const VERSION = '0.4.0'
+const VERSION = '0.4.1'
 /** 会话产出目录名：放在工作目录下，与工作区内容区分。 */
 const ARTIFACT_DIRNAME = '.dsh-sessions'
 /** 请求体上限：唯一合法的请求体就是一个小对象。 */
@@ -240,6 +240,7 @@ function collectDescendants(headers, rootId) {
  */
 async function deleteSession(deps, rootId) {
   const warnings = []
+  const remove = typeof deps.remove === 'function' ? deps.remove : rmrf
   const headers = await collectHeaders(deps)
   if (!headers.has(rootId)) {
     const header = await headerOf(deps, rootId)
@@ -260,6 +261,7 @@ async function deleteSession(deps, rootId) {
 
   /* 1) 归档并停止活动：durable 归档集合是 agent/pre-step 的门禁，先写它再停工作。
    *    已归档的会话 archiveSession 会直接 no-op、不会触发停止，所以先 unarchive 再归档。 */
+  const archivedBefore = new Map()
   for (const id of idList) {
     try {
       let alreadyArchived = false
@@ -268,6 +270,7 @@ async function deleteSession(deps, rootId) {
       } catch {
         alreadyArchived = false
       }
+      archivedBefore.set(id, alreadyArchived)
       if (alreadyArchived) {
         try {
           await deps.registry.unarchiveSession(id)
@@ -283,7 +286,7 @@ async function deleteSession(deps, rootId) {
   }
 
   /* 2) live 会话先做一次持久化屏障：归档门禁已生效，flush 把内存里未落盘的事件写干净。
-   *    失败就中止删除，宁可留着也绝不冒损坏日志的风险。 */
+   *    flush 失败只记警告继续删 —— 用户要求的是「删掉」，而不是因为运行时状态中止。 */
   for (const id of idList) {
     let live
     try {
@@ -296,53 +299,28 @@ async function deleteSession(deps, rootId) {
     try {
       await deps.sessions.flush(live)
     } catch (error) {
-      return {
-        ok: false,
-        code: 'flush-failed',
-        deleted: [],
-        failures: [{ path: '', error: `flush ${id}: ${textOf(error !== null && error !== undefined && error.message)}` }],
-        warnings,
-      }
+      warnings.push(`flush ${id}: ${textOf(error !== null && error !== undefined && error.message)}`)
     }
   }
 
-  /* 3) 等 live 会话真正退出（客户端收到归档后会关闭当前视图、释放句柄）。 */
-  const waitIds = idList.filter((id) => {
-    try {
-      return deps.sessions.get(id) !== undefined
-    } catch {
-      return false
-    }
-  })
-  const deadline = Date.now() + 5000
-  while (waitIds.length > 0 && Date.now() < deadline) {
-    for (let index = waitIds.length - 1; index >= 0; index -= 1) {
-      let live = false
+  /* 3) 给 live 会话一点时间自然退出（关闭视图、释放句柄），但绝不因此中止删除。
+   *    旧版在这里把「会话仍处于打开状态」当成「仍在运行」并返回 409，导致
+   *    一个没有任务、只是被打开过的会话也删不掉；现在最多等 1.5s 就继续删。 */
+  const deadline = Date.now() + 1500
+  while (Date.now() < deadline) {
+    let anyLive = false
+    for (const id of idList) {
       try {
-        live = deps.sessions.get(waitIds[index]) !== undefined
+        if (deps.sessions.get(id) !== undefined) {
+          anyLive = true
+          break
+        }
       } catch {
-        live = false
+        /* ignore */
       }
-      if (!live) waitIds.splice(index, 1)
     }
-    if (waitIds.length > 0) await sleep(100)
-  }
-  /* 仍有 live 会话时不要动文件：写入方稍后的 flush 可能把日志写回来。 */
-  const stillLive = idList.filter((id) => {
-    try {
-      return deps.sessions.get(id) !== undefined
-    } catch {
-      return false
-    }
-  })
-  if (stillLive.length > 0) {
-    return {
-      ok: false,
-      code: 'active',
-      deleted: [],
-      failures: [{ path: '', error: `session still live: ${stillLive.join(', ')}` }],
-      warnings,
-    }
+    if (!anyLive) break
+    await sleep(100)
   }
 
   /* 4) 工作区账目先 detach：workspace.sessionIds 的 getter 会按会话是否仍存在过滤，
@@ -392,7 +370,7 @@ async function deleteSession(deps, rootId) {
       warnings.push(`skip outside sessions root: ${dir}`)
       continue
     }
-    const result = await rmrf(dir)
+    const result = await remove(dir)
     if (!result.ok) failures.push({ path: dir, error: textOf(result.error !== null && result.error !== undefined && result.error.message) })
   }
 
@@ -401,7 +379,7 @@ async function deleteSession(deps, rootId) {
     if (!isSafeId(id)) continue
     const cache = projCachePath(id)
     if (!(await pathExists(cache))) continue
-    const result = await rmrf(cache)
+    const result = await remove(cache)
     if (!result.ok) failures.push({ path: cache, error: textOf(result.error !== null && result.error !== undefined && result.error.message) })
   }
 
@@ -412,7 +390,7 @@ async function deleteSession(deps, rootId) {
     if (typeof cwd !== 'string' || cwd === '' || !isAbsolute(cwd)) continue
     const artifactDir = artifactDirFor(cwd, id)
     if (!(await pathExists(artifactDir))) continue
-    const result = await rmrf(artifactDir)
+    const result = await remove(artifactDir)
     if (!result.ok) failures.push({ path: artifactDir, error: textOf(result.error !== null && result.error !== undefined && result.error.message) })
   }
 
@@ -429,6 +407,16 @@ async function deleteSession(deps, rootId) {
         await deps.registry.unarchiveSession(id)
       } catch {
         /* 未归档时不做任何事 */
+      }
+    }
+  } else {
+    /* 删除失败：把「为了删除而临时归档」的会话恢复成可见，避免用户看到灰掉却删不掉的残留。 */
+    for (const id of idList) {
+      if (archivedBefore.get(id) === true) continue
+      try {
+        await deps.registry.unarchiveSession(id)
+      } catch {
+        /* ignore */
       }
     }
   }
@@ -676,15 +664,6 @@ export default {
           return
         }
         if (!result.ok) {
-          if (result.code === 'active') {
-            sendJson(res, 409, {
-              ok: false,
-              code: 'active',
-              detail: (result.failures[0] ?? {}).error ?? '',
-              warnings: result.warnings,
-            })
-            return
-          }
           log('delete incomplete for', body.sessionId, result.failures)
           sendJson(res, 500, {
             ok: false,
@@ -704,7 +683,7 @@ export default {
       kind: 'exact',
       path: '/dsh-session-delete/ping',
       handler: (req, res) => {
-        if (rejectRequest(req, res)) return
+        /* 只读健康检查：不设栅栏，方便 curl/排障确认版本（不含任何敏感信息）。 */
         sendJson(res, 200, { ok: true, version: VERSION, artifactDirname: ARTIFACT_DIRNAME })
       },
     }), 'dsh-session-delete: ping route')
