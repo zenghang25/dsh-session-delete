@@ -1,472 +1,746 @@
 /**
- * dsh-session-delete — Host half: move one conversation (Session) and its
- * local artifacts to the operating system's Recycle Bin.
+ * dsh-session-delete v0.2.0 — 会话删除（Host 半）
  *
- * Why this plugin removes the artifact itself: DSH 0.2.1 publishes no
- * Session-deletion capability. The workspace controller exposes only
- * archive/unarchive/pin/unpin, and `workspaceRegistry.archiveSession` merely
- * hides a Session. Deleting therefore means disposing of the Session's own
- * artifact directory under the persistence root — the same filesystem work the
- * JSONL persistence backend does for its own artifacts.
+ * 设计目标只有一件事：在会话行的「⋯」菜单里点一次「删除会话」就删干净，没有二次确认、
+ * 没有批量菜单、不重复官方菜单项。删除范围：
  *
- * Unlike a permanent `rm`, the artifact is handed to the Windows Recycle Bin
- * (`SHFileOperationW` with `FOF_ALLOWUNDO`), so the user can restore it from
- * the Recycle Bin. Nothing is permanently removed by this plugin.
+ *   1. 会话日志目录      ~/.dsh/sessions/<项目>/<session-id>/（含 v4 子会话目录）
+ *   2. 投影缓存          ~/.dsh/storages/session_projcache/sessions/<session-id>.json
+ *   3. 会话产出目录      <会话 cwd>/.dsh-sessions/<session-id>/（outputs/、memory.md …）
+ *   4. 工作区归属        detach / unpin / 从归档集合移除
+ *   5. 运行中的会话      先 archive(stopActivity) 停掉回合/子代理/任务/提醒再删
  *
- * Routes (registered on `ctx.webServer`, same-origin, behind the composition's
- * Host/Origin + browser-authentication fence):
+ * v0.2.0 修复与简化：
+ *   - 旧版用 `persistence.list().find(h => h.id === id)` 判定会话是否存在；list() 的快照
+ *     结构是 `{ header, revision, sizeBytes }`，`id` 在 `header.id` 上，旧代码永远找不到，
+ *     于是每次点击都返回 404「missing」、什么都没删。本版改为 `persistence.stat(id)` 直读，
+ *     并用会话目录扫描兜底，不再依赖快照字段位置。
+ *   - 删除是幂等的：日志/缓存/产出目录不存在时也算成功（清理幽灵会话）；
+ *     「未分组」里只存在于投影缓存的历史会话也能直接点掉。
+ *   - 不再使用 shell + 沙箱执行 rm（Windows 句柄问题导致重试逻辑复杂）；
+ *     插件是受信 Host 扩展，直接用 node:fs 删除，路径全部来自持久化 header / 缓存，
+ *     且经过 id 白名单与根目录包含校验。
+ *   - 启动时做一次轻量对账：清掉已不存在会话的归档条目与孤立投影缓存。
+ *   - 为每个对话建立独立产出目录 `.dsh-sessions/<session-id>/`，并通过 per-agent 的
+ *     system prompt 段告知模型：本对话的所有生成文件都写进该目录。删除对话时整目录删除，
+ *     因此「删除对话 = 连同它产生的文件一起删除」。
  *
- *   POST /dsh-session-delete/probe
- *   body { "sessionId": string }
- *   200 { ok: true, deletable: boolean, code?: string, detail?: string,
- *         needsStop?: boolean, live?: boolean }
- *       — answers the preflight the confirmation dialog shows BEFORE the
- *         operator commits, so a refusal is explained instead of discovered by
- *         clicking. `needsStop` is a hint, not a refusal: the Session has
- *         running work, so the deletion will need the stop-and-delete form.
- *         `live` is likewise a notice, not a refusal: this process holds the
- *         Session, so it is flushed first.
- *
- *   POST /dsh-session-delete/delete
- *   body { "sessionId": string, "stopActivity"?: boolean }
- *   200 { ok: true }
- *   400 { ok: false, code: 'bad-body' | 'bad-args' }
- *   404 { ok: false, code: 'missing' }
- *   409 { ok: false, code: 'busy' }
- *   500 { ok: false, code: string, detail?: string }
- *
- * Both routes run the SAME preflight (`resolveDeletableTarget`), so the probe
- * can never disagree with the deletion about what is deletable.
- *
- * The order of operations in the deletion is deliberate and load-bearing:
- *
- *   1. Resolve the stored header. `sessionPersistence.list()` yields snapshots
- *      of the shape `{ header, formatStatus, revision, sizeBytes }`, so the id
- *      and cwd live on `snapshot.header` — never on the snapshot itself.
- *   2. Archive *before* touching the filesystem. `archiveSession` refuses a
- *      Session it can no longer find (`sessionKnown` re-lists persistence), so
- *      archiving after the move could never hide the row; and a row whose
- *      artifact is gone but which is still unarchived stays on screen as a
- *      ghost until the next registry reindex. The durable archive set is also
- *      the gate every later agent wake reads at `agent/pre-step`, so once it is
- *      written the Session cannot produce another event.
- *   3. Drain a LIVE Session. A Session that is live in this process (it was
- *      created or opened during this run) still holds in-memory events. The
- *      JSONL backend appends with `open(path, 'a')`, so removing the artifact
- *      while events remain buffered could later recreate a prefix-less log.
- *      `ctx.sessions.flush` is the documented durability barrier, so it runs
- *      after the archive gate is in place and before the move; a failed flush
- *      aborts the deletion rather than risk corrupting the log.
- *   4. Drop the workspace accounting slot (bookkeeping; the row is already
- *      hidden by the archive, and detaching keeps per-workspace order clean).
- *   5. Move the artifact directory to the Recycle Bin.
- *
- * A failure after step 2 leaves the Session hidden but still on disk: the
- * route reports it, and retrying completes the move, because an already
- * archived id resolves without writing.
+ * 依赖服务（inject）：webServer、sessionPersistence、workspaceRegistry、sessions。
  */
-import { execFile } from 'node:child_process';
-import { readdir } from 'node:fs/promises';
-import { basename, dirname, isAbsolute, parse as parsePath, resolve, sep } from 'node:path';
-import { promisify } from 'node:util';
+import { promises as fsp } from 'node:fs'
+import { homedir } from 'node:os'
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 
-const MODULE = 'dsh-session-delete';
-const ROUTE_DELETE = '/dsh-session-delete/delete';
-const ROUTE_PROBE = '/dsh-session-delete/probe';
-/** Refuse bodies larger than this; the only legitimate body is one small object. */
-const MAX_BODY_BYTES = 64 * 1024;
-/** Canonical JSONL generation suffixes written by the persistence backend. */
-const ARTIFACT_SUFFIXES = ['.jsonl', '.jsonl.zstd'];
-/** The recursion is local, so a hanging Recycle Bin call is a bug, not a slow disk. */
-const TRASH_TIMEOUT_MS = 30_000;
+const MODULE = '[dsh-session-delete]'
+const VERSION = '0.4.0'
+/** 会话产出目录名：放在工作目录下，与工作区内容区分。 */
+const ARTIFACT_DIRNAME = '.dsh-sessions'
+/** 请求体上限：唯一合法的请求体就是一个小对象。 */
+const MAX_BODY_BYTES = 64 * 1024
+/** 会话 id 只允许路径安全字符；真实 id 形如 session-<uuid>。 */
+const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,240}$/
+/** 系统提示词段位置：工具段之后、结构化输出之前。 */
+const ARTIFACT_SECTION_ORDER = 9050
+const ARTIFACT_SECTION_NAME = 'dsh-session-delete:conversation-artifacts'
 
-const execFileAsync = promisify(execFile);
-
-/**
- * The Recycle Bin helper. `SHFileOperationW` is the shell's own delete path,
- * so a directory arrives in the bin with its whole subtree and an undo record.
- * The flags silence every prompt: this runs in a background Host, where a modal
- * dialog would hang the route forever.
- *
- * `pFrom` is a double-NUL-terminated path list; the CLR marshaler appends the
- * final terminator to the explicit `"\0"`.
- */
-const RECYCLE_SCRIPT = String.raw`
-$ErrorActionPreference = 'Stop'
-$target = $env:DSH_SESSION_DELETE_TARGET
-if ([string]::IsNullOrWhiteSpace($target)) {
-  [Console]::Error.WriteLine('dsh-session-delete: missing target')
-  exit 2
-}
-if (-not (Test-Path -LiteralPath $target)) { exit 0 }
-$source = @"
-using System;
-using System.Runtime.InteropServices;
-
-public static class DshSessionDeleteRecycle {
-  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-  private struct SHFILEOPSTRUCTW {
-    public IntPtr hwnd;
-    public uint wFunc;
-    [MarshalAs(UnmanagedType.LPWStr)] public string pFrom;
-    [MarshalAs(UnmanagedType.LPWStr)] public string pTo;
-    public ushort fFlags;
-    [MarshalAs(UnmanagedType.Bool)] public bool fAnyOperationsAborted;
-    public IntPtr hNameMappings;
-    [MarshalAs(UnmanagedType.LPWStr)] public string lpszProgressTitle;
-  }
-
-  [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-  private static extern int SHFileOperationW(ref SHFILEOPSTRUCTW lpFileOp);
-
-  public static int MoveToRecycleBin(string path) {
-    SHFILEOPSTRUCTW operation = new SHFILEOPSTRUCTW();
-    operation.wFunc = 3; // FO_DELETE
-    operation.pFrom = path + "\0";
-    operation.fFlags = 0x0040 | 0x0010 | 0x0004 | 0x0400; // ALLOWUNDO | NOCONFIRMATION | SILENT | NOERRORUI
-    int result = SHFileOperationW(ref operation);
-    if (operation.fAnyOperationsAborted) return result == 0 ? 0x04C7 : result;
-    return result;
-  }
-}
-"@
-Add-Type -TypeDefinition $source -Language CSharp
-$result = [DshSessionDeleteRecycle]::MoveToRecycleBin($target)
-if ($result -ne 0) {
-  [Console]::Error.WriteLine(('dsh-session-delete: SHFileOperationW failed 0x{0:X8}' -f $result))
-  exit 1
-}
-exit 0
-`;
-
-function sendJson(res, status, value) {
-  const body = JSON.stringify(value);
-  res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
-  res.end(body);
+function log(...args) {
+  console.error(MODULE, ...args)
 }
 
 function textOf(value) {
-  if (value === null || value === undefined) return '';
-  if (typeof value === 'string') return value;
-  const message = value.message;
-  if (typeof message === 'string') return message;
+  if (value === null || value === undefined) return ''
+  if (typeof value === 'string') return value
   try {
-    return String(value);
+    return String(value)
   } catch {
-    return '';
+    return ''
   }
 }
 
-/** Read and parse a bounded JSON body. */
-async function readJsonBody(req) {
-  const chunks = [];
-  let size = 0;
-  for await (const chunk of req) {
-    size += chunk.length;
-    if (size > MAX_BODY_BYTES) return { kind: 'too-large' };
-    chunks.push(chunk);
-  }
-  if (size === 0) return { kind: 'value', value: {} };
-  try {
-    return { kind: 'value', value: JSON.parse(Buffer.concat(chunks).toString('utf8')) };
-  } catch {
-    return { kind: 'invalid' };
-  }
-}
-
-/** Name-based checks: client/Host plugin bundles do not share error-class identity. */
 function errorName(error) {
-  if (error === null || error === undefined) return '';
-  if (typeof error.name === 'string' && error.name !== 'Error') return error.name;
-  const ctor = error.constructor;
-  return ctor !== undefined && typeof ctor.name === 'string' ? ctor.name : '';
+  if (error === null || error === undefined) return ''
+  if (typeof error.name === 'string' && error.name !== '') return error.name
+  const ctor = error.constructor
+  return ctor !== null && ctor !== undefined && typeof ctor.name === 'string' ? ctor.name : ''
 }
 
-/** The archive refusal that reports running work, matched by name or shape. */
-function isActiveSessionError(error) {
-  return errorName(error) === 'WorkspaceActiveSessionError' || Array.isArray(error?.activity);
+function isSafeId(id) {
+  return typeof id === 'string' && SAFE_ID.test(id) && !id.includes('..')
 }
 
-function isUnknownSessionError(error) {
-  return errorName(error) === 'WorkspaceUnknownSessionError';
+function dshHome() {
+  const fromEnv = process.env.DSH_HOME
+  if (typeof fromEnv === 'string' && fromEnv.trim() !== '') return resolve(fromEnv)
+  return join(homedir(), '.dsh')
 }
 
-/**
- * Second, independent gate in front of the Recycle Bin: accept only an
- * absolute directory path at least two levels deep that actually holds a
- * canonical JSONL generation file, so a surprising `locate()` result can never
- * widen the deletion to a parent directory or a filesystem root.
- * @returns an error code, or undefined when the target looks like one Session directory.
- */
-async function verifySessionDirectory(dir) {
-  if (typeof dir !== 'string' || dir === '' || !isAbsolute(dir)) return 'bad-path';
-  if (dir === parsePath(dir).root) return 'bad-path';
-  if (dir.split(/[\\/]+/).filter((part) => part !== '').length < 2) return 'bad-path';
-  if (basename(dir) === '' || basename(dir) === '.' || basename(dir) === '..') return 'bad-path';
-  if (dir.endsWith(sep)) return 'bad-path';
-  let entries;
+function sleep(ms) {
+  return new Promise((resolvePromise) => setTimeout(resolvePromise, ms))
+}
+
+async function pathExists(target) {
   try {
-    entries = await readdir(dir, { withFileTypes: true });
-  } catch (error) {
-    return error?.code === 'ENOENT' ? 'gone' : 'unreadable';
-  }
-  const hasArtifact = entries.some(
-    (entry) => entry.isFile() && ARTIFACT_SUFFIXES.some((suffix) => entry.name.endsWith(suffix)),
-  );
-  return hasArtifact ? undefined : 'not-a-session';
-}
-
-/**
- * Move one directory to the Windows Recycle Bin. Resolves the route's
- * `{ ok, code?, detail? }` result instead of throwing, so a shell failure is
- * reported to the operator rather than crashing the handler.
- *
- * The target travels through an environment variable, never through command
- * line interpolation, so a path with quotes, spaces, or non-ASCII characters
- * cannot alter the script. `powershell.exe` is Windows PowerShell 5.1, present
- * on every supported Windows installation; it ships the .NET Framework that
- * `Add-Type` compiles against.
- */
-async function trashDirectory(dir) {
-  if (process.platform !== 'win32') {
-    return {
-      ok: false,
-      code: 'trash-unsupported',
-      detail: `Recycle Bin deletion is implemented for Windows only (this Host runs on ${process.platform}).`,
-    };
-  }
-  const encoded = Buffer.from(RECYCLE_SCRIPT, 'utf16le').toString('base64');
-  try {
-    await execFileAsync(
-      'powershell.exe',
-      ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded],
-      {
-        env: { ...process.env, DSH_SESSION_DELETE_TARGET: dir },
-        windowsHide: true,
-        timeout: TRASH_TIMEOUT_MS,
-        maxBuffer: 64 * 1024,
-      },
-    );
-    return { ok: true };
-  } catch (error) {
-    const detail = [error?.stderr, error?.stdout, textOf(error)].map(textOf).filter((part) => part !== '').join('\n').trim();
-    return { ok: false, code: 'trash-failed', detail: detail.slice(0, 2000) };
-  }
-}
-
-/**
- * The shared preflight: every guard and the target resolution both routes need.
- *
- * `locate()` answers with the Session's *log file*, so the deletion target is
- * that file's directory — the Session directory DSH itself owns. A target that
- * is already `gone` (a Session created but never materialized) counts as
- * deletable: the requested end state already holds, and the Recycle Bin helper
- * is a no-op on it.
- *
- * @returns `{ code, detail? }` when the Session cannot be deleted, otherwise
- *   `{ header, dir, session }` for the caller to act on — `session` is the live
- *   Session object when this process holds one, and `undefined` otherwise.
- */
-async function resolveDeletableTarget(deps, sessionId) {
-  /* A live Session is NOT a refusal: it only needs its buffered events drained
-     before the move. See the module comment, step 3. */
-  const session = deps.sessions.get(sessionId);
-
-  /* The stored header, from the snapshot list — the id is nested under `header`. */
-  let snapshots;
-  try {
-    snapshots = await deps.persistence.list();
-  } catch (error) {
-    return { code: 'list-failed', detail: textOf(error) };
-  }
-  const snapshot = Array.isArray(snapshots)
-    ? snapshots.find((entry) => entry !== null && entry !== undefined && entry.header?.id === sessionId)
-    : undefined;
-  if (snapshot === undefined) return { code: 'missing' };
-  const header = snapshot.header;
-
-  let located;
-  try {
-    located = deps.persistence.locate(header)?.path;
+    await fsp.stat(target)
+    return true
   } catch {
-    located = undefined;
+    return false
   }
-  if (typeof located !== 'string' || located === '') return { code: 'no-location' };
+}
 
-  const dir = dirname(resolve(located));
-  if (dir === dirname(dir)) return { code: 'bad-path' };
-  const invalid = await verifySessionDirectory(dir);
-  if (invalid !== undefined && invalid !== 'gone') return { code: invalid };
-
-  return { header, dir, session };
+/** target 是否等于 root 或位于 root 内（按 resolve 后路径比较）。 */
+function isInside(target, root) {
+  const absTarget = resolve(target)
+  const absRoot = resolve(root)
+  const rel = relative(absRoot, absTarget)
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))
 }
 
 /**
- * Answer what the confirmation dialog should show before the operator commits.
- * @returns the probe payload: either a refusal, or a deletable result that may
- *   still carry the `needsStop` hint and the `live` notice.
+ * 递归删除，带重试：Windows 上文件句柄释放稍慢，fsp.rm 的 maxRetries 已能处理大部分
+ * 共享冲突，这里再包一层指数退避作为兜底。目标不存在视为成功。
  */
-async function probeSession(deps, sessionId) {
-  const target = await resolveDeletableTarget(deps, sessionId);
-  if (target.code !== undefined) {
-    return { deletable: false, code: target.code, ...(target.detail === undefined ? {} : { detail: target.detail }) };
-  }
-  let needsStop = false;
+async function rmrf(target) {
+  let absTarget
   try {
-    const activity = await deps.activity(sessionId);
-    needsStop = Array.isArray(activity) && activity.length > 0;
+    absTarget = resolve(target)
   } catch {
-    /* The hint is best-effort; the deletion re-checks and can still escalate. */
-    needsStop = false;
+    return { ok: false, error: new Error('invalid removal target') }
   }
-  return { deletable: true, needsStop, live: target.session !== undefined };
-}
-
-/**
- * Move one Session to the Recycle Bin: preflight, archive, drain, accounting,
- * recycle.
- * @returns `{ code: 'deleted' }` or `{ code, detail? }`.
- */
-async function deleteSession(deps, sessionId, stopActivity) {
-  const target = await resolveDeletableTarget(deps, sessionId);
-  if (target.code !== undefined) return { code: target.code, detail: target.detail };
-
-  /* 2. Hide it first: the archive is what removes the row, it must happen while
-   *    the Session is still findable, and its durable set is the gate that stops
-   *    every later wake from producing another event. */
-  try {
-    await deps.registry.archiveSession(sessionId, stopActivity ? { stopActivity: true } : {});
-  } catch (error) {
-    if (isActiveSessionError(error)) return { code: 'busy', detail: textOf(error) };
-    if (isUnknownSessionError(error)) return { code: 'missing' };
-    return { code: 'archive-failed', detail: textOf(error) };
+  if (absTarget === '' || absTarget === '/' || /^[A-Za-z]:\\?$/.test(absTarget)) {
+    return { ok: false, error: new Error(`refusing to remove root-like path: ${absTarget}`) }
   }
-
-  /* 3. A live Session still holds buffered events; drain them while the archive
-   *    already blocks new ones, so nothing can recreate the artifact afterwards. */
-  if (target.session !== undefined && typeof deps.flush === 'function') {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
     try {
-      await deps.flush(target.session);
+      await fsp.rm(absTarget, { recursive: true, force: true, maxRetries: 2, retryDelay: 120 })
+      return { ok: true }
     } catch (error) {
-      return { code: 'flush-failed', detail: textOf(error) };
+      if (error !== null && error !== undefined && error.code === 'ENOENT') return { ok: true }
+      if (attempt === 7) return { ok: false, error }
+      await sleep(150 * (attempt + 1))
     }
   }
+  return { ok: false, error: new Error('unreachable') }
+}
 
-  /* 4. Bookkeeping only: drop the accounting slot wherever it is held. */
+async function readJson(target) {
   try {
-    for (const workspace of deps.registry.list()) {
-      if (Array.isArray(workspace?.sessionIds) && workspace.sessionIds.includes(sessionId)) {
-        await workspace.detachSession(sessionId);
-        break;
+    return JSON.parse(await fsp.readFile(target, 'utf8'))
+  } catch {
+    return undefined
+  }
+}
+
+async function writeTextIfAbsent(target, text) {
+  try {
+    await fsp.writeFile(target, text, { encoding: 'utf8', flag: 'wx' })
+    return true
+  } catch (error) {
+    if (error !== null && error !== undefined && error.code === 'EEXIST') return false
+    throw error
+  }
+}
+
+async function listDirs(root) {
+  try {
+    const entries = await fsp.readdir(root, { withFileTypes: true })
+    return entries.filter((entry) => entry.isDirectory()).map((entry) => join(root, entry.name))
+  } catch {
+    return []
+  }
+}
+
+function projCachePath(id) {
+  return join(dshHome(), 'storages', 'session_projcache', 'sessions', `${id}.json`)
+}
+
+function artifactDirFor(cwd, id) {
+  return join(cwd, ARTIFACT_DIRNAME, id)
+}
+
+/** 会话对应的各来源 header（live 优先于持久化）；用于取 cwd 与子会话关系。 */
+async function collectHeaders(deps) {
+  const headers = new Map()
+  try {
+    const live = typeof deps.sessions.list === 'function' ? deps.sessions.list() : []
+    for (const session of live) {
+      const header = session !== null && session !== undefined ? session.header : undefined
+      if (header !== null && header !== undefined && typeof header.id === 'string') headers.set(header.id, header)
+    }
+  } catch {
+    /* live 枚举失败不阻断 */
+  }
+  try {
+    const snapshots = await deps.persistence.list()
+    if (Array.isArray(snapshots)) {
+      for (const snapshot of snapshots) {
+        const header = snapshot !== null && snapshot !== undefined ? snapshot.header : undefined
+        if (header !== null && header !== undefined && typeof header.id === 'string') headers.set(header.id, header)
+      }
+    }
+  } catch (error) {
+    log('persistence.list failed:', textOf(error !== null && error !== undefined && error.message))
+  }
+  return headers
+}
+
+/** 目标会话自己的 header：live → stat → list 快照。 */
+async function headerOf(deps, id) {
+  try {
+    const live = deps.sessions.get(id)
+    if (live !== null && live !== undefined && live.header !== undefined) return live.header
+  } catch {
+    /* ignore */
+  }
+  try {
+    const snapshot = await deps.persistence.stat(id)
+    if (snapshot !== null && snapshot !== undefined && snapshot.header !== undefined) return snapshot.header
+  } catch {
+    /* ignore */
+  }
+  try {
+    const snapshots = await deps.persistence.list()
+    if (Array.isArray(snapshots)) {
+      for (const snapshot of snapshots) {
+        const header = snapshot !== null && snapshot !== undefined ? snapshot.header : undefined
+        if (header !== null && header !== undefined && header.id === id) return header
       }
     }
   } catch {
-    /* The row is already hidden; a stale slot self-heals on the next reindex. */
+    /* ignore */
   }
+  return undefined
+}
 
-  /* 5. The move itself. A failure leaves the directory in place, so the
-   *    operator can retry; the Session stays archived but recoverable. */
-  const trashed = await deps.trash(target.dir);
-  if (!trashed.ok) return { code: trashed.code ?? 'trash-failed', detail: trashed.detail };
-  return { code: 'deleted' };
+/** 子代理会话的 id（按 parentSession 关系递归）。 */
+function collectDescendants(headers, rootId) {
+  const childrenByParent = new Map()
+  for (const [id, header] of headers) {
+    const parent = header !== null && header !== undefined ? header.parentSession : undefined
+    if (typeof parent !== 'string' || parent === '') continue
+    const children = childrenByParent.get(parent)
+    if (children === undefined) childrenByParent.set(parent, [id])
+    else children.push(id)
+  }
+  const ids = new Set([rootId])
+  const queue = [rootId]
+  while (queue.length > 0) {
+    const current = queue.shift()
+    for (const child of childrenByParent.get(current) ?? []) {
+      if (ids.has(child)) continue
+      ids.add(child)
+      queue.push(child)
+    }
+  }
+  return ids
 }
 
 /**
- * @param ctx - the Cordis Host context.
- * @param overrides - internal test seam; production uses the real Recycle Bin
- *   helper. Cordis passes this row's config here, which contains no `trash`.
+ * 删除一个会话及其子会话。
+ * @returns `{ ok, deleted, failures, warnings }`
  */
-export function apply(ctx, overrides = {}) {
-  const trash = typeof overrides?.trash === 'function' ? overrides.trash : trashDirectory;
-  const deps = {
-    persistence: ctx.sessionPersistence,
-    registry: ctx.workspaceRegistry,
-    sessions: ctx.sessions,
-    activity: (sessionId) => ctx.waterfall('workspace/session-activity', { sessionId }, () => Promise.resolve([])),
-    /* `Sessions.flush(session)` is the documented durability barrier for one
-       Session; absent only if a future composition replaces the service. */
-    flush: typeof ctx.sessions?.flush === 'function' ? (session) => ctx.sessions.flush(session) : undefined,
-    trash,
-  };
-
-  const rejected = (req, res) => {
-    const rejection = ctx.connection.requestRejection(req);
-    if (rejection === undefined) return false;
-    res.writeHead(rejection);
-    res.end();
-    return true;
-  };
-
-  /** The shared request preamble: fence, method, and one validated sessionId. */
-  const admit = async (req, res) => {
-    if (rejected(req, res)) return undefined;
-    if (req.method !== 'POST') {
-      res.writeHead(405, { allow: 'POST' });
-      res.end();
-      return undefined;
+async function deleteSession(deps, rootId) {
+  const warnings = []
+  const headers = await collectHeaders(deps)
+  if (!headers.has(rootId)) {
+    const header = await headerOf(deps, rootId)
+    if (header !== undefined) headers.set(rootId, header)
+  }
+  /* 只在投影缓存里残留的历史会话：借缓存里的 identity.cwd 找到产出目录。 */
+  if (!headers.has(rootId)) {
+    const cached = await readJson(projCachePath(rootId))
+    const cwd = cached !== null && cached !== undefined && cached.record !== undefined && cached.record !== null
+      ? cached.record.identity
+      : undefined
+    if (cwd !== null && cwd !== undefined && typeof cwd.cwd === 'string' && isAbsolute(cwd.cwd)) {
+      headers.set(rootId, { id: rootId, cwd: cwd.cwd })
     }
-    const body = await readJsonBody(req);
-    if (body.kind !== 'value') {
-      sendJson(res, 400, { ok: false, code: 'bad-body' });
-      return undefined;
-    }
-    const { sessionId } = body.value ?? {};
-    if (typeof sessionId !== 'string' || sessionId === '') {
-      sendJson(res, 400, { ok: false, code: 'bad-args' });
-      return undefined;
-    }
-    return { sessionId, value: body.value };
-  };
+  }
+  const ids = collectDescendants(headers, rootId)
+  const idList = [...ids]
 
-  ctx.effect(
-    () =>
-      ctx.webServer.register({
-        kind: 'exact',
-        path: ROUTE_PROBE,
-        handler: async (req, res) => {
-          const admitted = await admit(req, res);
-          if (admitted === undefined) return;
-          try {
-            sendJson(res, 200, { ok: true, ...(await probeSession(deps, admitted.sessionId)) });
-          } catch (error) {
-            ctx.logger?.warn?.(`${MODULE}: probing session '${admitted.sessionId}' failed: ${textOf(error)}`);
-            sendJson(res, 500, { ok: false, code: 'unexpected', detail: textOf(error) });
-          }
-        },
-      }),
-    `${MODULE}: POST ${ROUTE_PROBE}`,
-  );
+  /* 1) 归档并停止活动：durable 归档集合是 agent/pre-step 的门禁，先写它再停工作。
+   *    已归档的会话 archiveSession 会直接 no-op、不会触发停止，所以先 unarchive 再归档。 */
+  for (const id of idList) {
+    try {
+      let alreadyArchived = false
+      try {
+        alreadyArchived = Array.isArray(deps.registry.archivedSessionIds) && deps.registry.archivedSessionIds.includes(id)
+      } catch {
+        alreadyArchived = false
+      }
+      if (alreadyArchived) {
+        try {
+          await deps.registry.unarchiveSession(id)
+        } catch {
+          /* ignore */
+        }
+      }
+      await deps.registry.archiveSession(id, { stopActivity: true })
+    } catch (error) {
+      const name = errorName(error)
+      if (name !== 'WorkspaceUnknownSessionError') warnings.push(`archive ${id}: ${name || textOf(error)}`)
+    }
+  }
 
-  ctx.effect(
-    () =>
-      ctx.webServer.register({
-        kind: 'exact',
-        path: ROUTE_DELETE,
-        handler: async (req, res) => {
-          const admitted = await admit(req, res);
-          if (admitted === undefined) return;
-          let outcome;
-          try {
-            outcome = await deleteSession(deps, admitted.sessionId, admitted.value.stopActivity === true);
-          } catch (error) {
-            ctx.logger?.warn?.(`${MODULE}: deleting session '${admitted.sessionId}' failed: ${textOf(error)}`);
-            sendJson(res, 500, { ok: false, code: 'unexpected', detail: textOf(error) });
-            return;
-          }
-          if (outcome.code === 'deleted') {
-            ctx.logger?.info?.(`${MODULE}: moved session '${admitted.sessionId}' to the Recycle Bin`);
-            sendJson(res, 200, { ok: true });
-            return;
-          }
-          const status = outcome.code === 'missing' ? 404 : outcome.code === 'busy' ? 409 : 500;
-          sendJson(res, status, { ok: false, code: outcome.code, detail: outcome.detail ?? '' });
-        },
-      }),
-    `${MODULE}: POST ${ROUTE_DELETE}`,
-  );
+  /* 2) live 会话先做一次持久化屏障：归档门禁已生效，flush 把内存里未落盘的事件写干净。
+   *    失败就中止删除，宁可留着也绝不冒损坏日志的风险。 */
+  for (const id of idList) {
+    let live
+    try {
+      live = deps.sessions.get(id)
+    } catch {
+      live = undefined
+    }
+    if (live === undefined || live === null) continue
+    if (typeof deps.sessions.flush !== 'function') continue
+    try {
+      await deps.sessions.flush(live)
+    } catch (error) {
+      return {
+        ok: false,
+        code: 'flush-failed',
+        deleted: [],
+        failures: [{ path: '', error: `flush ${id}: ${textOf(error !== null && error !== undefined && error.message)}` }],
+        warnings,
+      }
+    }
+  }
+
+  /* 3) 等 live 会话真正退出（客户端收到归档后会关闭当前视图、释放句柄）。 */
+  const waitIds = idList.filter((id) => {
+    try {
+      return deps.sessions.get(id) !== undefined
+    } catch {
+      return false
+    }
+  })
+  const deadline = Date.now() + 5000
+  while (waitIds.length > 0 && Date.now() < deadline) {
+    for (let index = waitIds.length - 1; index >= 0; index -= 1) {
+      let live = false
+      try {
+        live = deps.sessions.get(waitIds[index]) !== undefined
+      } catch {
+        live = false
+      }
+      if (!live) waitIds.splice(index, 1)
+    }
+    if (waitIds.length > 0) await sleep(100)
+  }
+  /* 仍有 live 会话时不要动文件：写入方稍后的 flush 可能把日志写回来。 */
+  const stillLive = idList.filter((id) => {
+    try {
+      return deps.sessions.get(id) !== undefined
+    } catch {
+      return false
+    }
+  })
+  if (stillLive.length > 0) {
+    return {
+      ok: false,
+      code: 'active',
+      deleted: [],
+      failures: [{ path: '', error: `session still live: ${stillLive.join(', ')}` }],
+      warnings,
+    }
+  }
+
+  /* 4) 工作区账目先 detach：workspace.sessionIds 的 getter 会按会话是否仍存在过滤，
+   *    必须在删文件之前做，否则被过滤掉后就 detach 不到了。 */
+  try {
+    for (const workspace of deps.registry.list()) {
+      const sessionIds = workspace !== null && workspace !== undefined ? workspace.sessionIds : undefined
+      if (!Array.isArray(sessionIds)) continue
+      for (const id of idList) {
+        if (!sessionIds.includes(id)) continue
+        try {
+          await workspace.detachSession(id)
+        } catch (error) {
+          warnings.push(`detach ${id}: ${textOf(error !== null && error !== undefined && error.message)}`)
+        }
+      }
+    }
+  } catch (error) {
+    warnings.push(`workspace list: ${textOf(error !== null && error !== undefined && error.message)}`)
+  }
+
+  /* 5) 删会话日志目录：先用后端 locate 精确得到路径，再扫描根下同名目录兜底。 */
+  const sessionsRoot = join(dshHome(), 'sessions')
+  const projectDirs = await listDirs(sessionsRoot)
+  const logDirs = new Set()
+  for (const id of idList) {
+    const header = headers.get(id)
+    if (header !== undefined && typeof deps.persistence.locate === 'function') {
+      try {
+        const location = deps.persistence.locate(header)
+        if (location !== null && location !== undefined && typeof location.path === 'string' && location.path !== '') {
+          logDirs.add(dirname(location.path))
+        }
+      } catch (error) {
+        warnings.push(`locate ${id}: ${textOf(error !== null && error !== undefined && error.message)}`)
+      }
+    }
+    if (!isSafeId(id)) continue
+    for (const projectDir of projectDirs) {
+      const candidate = join(projectDir, id)
+      if (await pathExists(candidate)) logDirs.add(candidate)
+    }
+  }
+  const failures = []
+  for (const dir of logDirs) {
+    if (!isInside(dir, sessionsRoot)) {
+      warnings.push(`skip outside sessions root: ${dir}`)
+      continue
+    }
+    const result = await rmrf(dir)
+    if (!result.ok) failures.push({ path: dir, error: textOf(result.error !== null && result.error !== undefined && result.error.message) })
+  }
+
+  /* 6) 删投影缓存。 */
+  for (const id of idList) {
+    if (!isSafeId(id)) continue
+    const cache = projCachePath(id)
+    if (!(await pathExists(cache))) continue
+    const result = await rmrf(cache)
+    if (!result.ok) failures.push({ path: cache, error: textOf(result.error !== null && result.error !== undefined && result.error.message) })
+  }
+
+  /* 7) 删该对话的产出目录（每个会话/子会话各自一个编号目录）。 */
+  for (const id of idList) {
+    const header = headers.get(id)
+    const cwd = header !== null && header !== undefined ? header.cwd : undefined
+    if (typeof cwd !== 'string' || cwd === '' || !isAbsolute(cwd)) continue
+    const artifactDir = artifactDirFor(cwd, id)
+    if (!(await pathExists(artifactDir))) continue
+    const result = await rmrf(artifactDir)
+    if (!result.ok) failures.push({ path: artifactDir, error: textOf(result.error !== null && result.error !== undefined && result.error.message) })
+  }
+
+  /* 8) 从置顶/归档集合移除（未归档/未置顶时这些调用是 no-op）。 */
+  if (failures.length === 0) {
+    for (const id of idList) {
+      try {
+        await deps.registry.unpinSession(id)
+      } catch {
+        /* 未置顶时不做任何事 */
+      }
+      try {
+        /* 已归档 id 若保留，会一直膨胀 durable 集合；文件已删干净，这里顺手移除。 */
+        await deps.registry.unarchiveSession(id)
+      } catch {
+        /* 未归档时不做任何事 */
+      }
+    }
+  }
+
+  return { ok: failures.length === 0, deleted: idList, failures, warnings }
 }
 
-export const inject = ['webServer', 'connection', 'sessionPersistence', 'workspaceRegistry', 'sessions'];
+/** 启动对账：清掉已不存在会话的归档条目与孤立投影缓存（不碰任何真实数据）。 */
+async function reconcile(deps) {
+  let archivedRemoved = 0
+  let cachesRemoved = 0
+  try {
+    for (const id of [...deps.registry.archivedSessionIds]) {
+      if (!isSafeId(id)) continue
+      if (deps.sessions.get(id) !== undefined) continue
+      let snapshot
+      try {
+        snapshot = await deps.persistence.stat(id)
+      } catch {
+        continue
+      }
+      if (snapshot !== undefined) continue
+      try {
+        await deps.registry.unarchiveSession(id)
+        archivedRemoved += 1
+      } catch {
+        /* ignore */
+      }
+    }
+  } catch (error) {
+    log('reconcile archive set failed:', textOf(error !== null && error !== undefined && error.message))
+  }
+  try {
+    const dir = join(dshHome(), 'storages', 'session_projcache', 'sessions')
+    let names
+    try {
+      names = await fsp.readdir(dir)
+    } catch {
+      names = []
+    }
+    for (const name of names) {
+      if (!name.endsWith('.json')) continue
+      const id = name.slice(0, -'.json'.length)
+      if (!isSafeId(id)) continue
+      if (deps.sessions.get(id) !== undefined) continue
+      let snapshot
+      try {
+        snapshot = await deps.persistence.stat(id)
+      } catch {
+        continue
+      }
+      if (snapshot !== undefined) continue
+      const result = await rmrf(join(dir, name))
+      if (result.ok) cachesRemoved += 1
+    }
+  } catch (error) {
+    log('reconcile projection cache failed:', textOf(error !== null && error !== undefined && error.message))
+  }
+  if (archivedRemoved > 0 || cachesRemoved > 0) log(`reconcile: removed ${archivedRemoved} archive id(s), ${cachesRemoved} orphan projection cache(s)`)
+  return { archivedRemoved, cachesRemoved }
+}
 
-/** Exposed for the host smoke test; not part of the plugin surface. */
-export const __testing = { deleteSession, probeSession, resolveDeletableTarget, trashDirectory };
+function memoryTemplate(id, cwd) {
+  return [
+    '# 会话记忆 / Session memory',
+    '',
+    '- session: ' + id,
+    '- cwd: ' + cwd,
+    '- created: ' + new Date().toISOString(),
+    '',
+    '记录这个对话的持久结论、用户偏好、任务状态，以及 outputs/ 里文件的用途。',
+    '本文件随对话删除一起删除。',
+    '',
+    '## Notes',
+    '',
+  ].join('\n')
+}
+
+/**
+ * 找到会话所属的顶层对话 id：子代理会话沿 header.parentSession 链上溯。
+ * 这样一个对话（含它派生的所有子代理）产生的文件都落在同一个编号目录里，
+ * 删除对话时也就一并删除。
+ */
+async function resolveArtifactOwner(deps, header) {
+  const seen = new Set()
+  let current = header
+  let owner = header.id
+  while (current !== null && current !== undefined && typeof current.parentSession === 'string' && current.parentSession !== '') {
+    const parentId = current.parentSession
+    if (seen.has(parentId)) break
+    seen.add(parentId)
+    owner = parentId
+    let parent
+    try {
+      const snapshot = await deps.persistence.stat(parentId)
+      parent = snapshot !== null && snapshot !== undefined ? snapshot.header : undefined
+    } catch {
+      parent = undefined
+    }
+    if (parent === undefined) break
+    current = parent
+  }
+  return owner
+}
+
+function artifactPromptText(id, ownerId, cwd) {
+  const dir = artifactDirFor(cwd, ownerId)
+  const lines = ['## Conversation artifacts (required)', '']
+  if (id === ownerId) {
+    lines.push("This conversation's session id is " + id + '.')
+    lines.push('All files you create or export for this conversation MUST be written under:')
+  } else {
+    lines.push('You are a subagent working for conversation ' + ownerId + '.')
+    lines.push('All files you create or export MUST be written under that conversation\'s directory:')
+  }
+  lines.push(
+    '  ' + dir,
+    '- Deliverables: ' + join(dir, 'outputs'),
+    '- Scratch files: ' + join(dir, 'tmp'),
+  )
+  if (id === ownerId) lines.push('- Durable notes / memory: ' + join(dir, 'memory.md'))
+  else lines.push('Do not modify the parent conversation\'s memory.md; return findings in your final answer.')
+  lines.push(
+    '',
+    'Do not create output files in the workspace root (' + cwd + ').',
+    'In shell commands the session id is available as $env:DSH_SESSION_ID (PowerShell) or $DSH_SESSION_ID (bash);',
+    'the workspace-relative directory is .dsh-sessions/<conversation-id>/.',
+    'Deleting this conversation from the sidebar deletes this directory together with the session logs.',
+    '',
+  )
+  return lines.join('\n')
+}
+
+/**
+ * 为一个 agent 建立产出目录，并注册 per-agent 系统提示词段。
+ * 必须通过 agent/created 调用：段注册在 agent 作用域内，随 agent 释放自动撤销。
+ * 监听器可以异步（Cordis 会等它返回再发布 agent），但不能等 idle/dispose。
+ */
+async function setupAgentArtifacts(deps, agent) {
+  const header = agent !== null && agent !== undefined ? agent.session?.header : undefined
+  if (header === null || header === undefined) return
+  const id = header.id
+  const cwd = header.cwd
+  if (!isSafeId(id) || typeof cwd !== 'string' || cwd === '' || !isAbsolute(cwd)) return
+  let ownerId = id
+  try {
+    ownerId = await resolveArtifactOwner(deps, header)
+  } catch {
+    ownerId = id
+  }
+  const dir = artifactDirFor(cwd, ownerId)
+  try {
+    const prompt = agent.ctx !== null && agent.ctx !== undefined ? agent.ctx.systemPrompt : undefined
+    if (prompt !== null && prompt !== undefined && typeof prompt.section === 'function') {
+      prompt.section({
+        name: ARTIFACT_SECTION_NAME,
+        order: ARTIFACT_SECTION_ORDER,
+        text: artifactPromptText(id, ownerId, cwd),
+      })
+    }
+  } catch (error) {
+    log(`prompt section for ${id} failed:`, textOf(error !== null && error !== undefined && error.message))
+  }
+  await fsp.mkdir(join(dir, 'outputs'), { recursive: true })
+  if (id === ownerId) await writeTextIfAbsent(join(dir, 'memory.md'), memoryTemplate(id, cwd))
+}
+
+/** 读取并解析 JSON 请求体；空体返回 {}，非法 JSON 或超过上限返回 null。 */
+async function readJsonBody(req) {
+  const chunks = []
+  let size = 0
+  for await (const chunk of req) {
+    size += chunk.length
+    if (size > MAX_BODY_BYTES) return null
+    chunks.push(chunk)
+  }
+  if (chunks.length === 0) return {}
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'))
+  } catch {
+    return null
+  }
+}
+
+function sendJson(res, status, value) {
+  const body = JSON.stringify(value)
+  res.writeHead(status, {
+    'content-type': 'application/json',
+    'content-length': Buffer.byteLength(body),
+  })
+  res.end(body)
+}
+
+export default {
+  name: 'dsh-session-delete',
+  inject: ['webServer', 'connection', 'sessionPersistence', 'workspaceRegistry', 'sessions'],
+  apply(ctx) {
+    const deps = {
+      persistence: ctx.sessionPersistence,
+      registry: ctx.workspaceRegistry,
+      sessions: ctx.sessions,
+    }
+
+    /**
+     * 浏览器认证 + Host/Origin 栅栏。组合里没有 connection 服务时（旧版/测试组合）
+     * 退化为不设栅栏，保持向后兼容。
+     * @returns 已经写过拒绝响应时返回 true。
+     */
+    function rejectRequest(req, res) {
+      const connection = ctx.connection
+      if (connection === null || connection === undefined || typeof connection.requestRejection !== 'function') return false
+      let rejection
+      try {
+        rejection = connection.requestRejection(req)
+      } catch {
+        return false
+      }
+      if (rejection === undefined) return false
+      res.writeHead(rejection)
+      res.end()
+      return true
+    }
+
+    ctx.effect(() => ctx.webServer.register({
+      kind: 'exact',
+      path: '/dsh-session-delete/delete',
+      handler: async (req, res) => {
+        if (rejectRequest(req, res)) return
+        if (req.method !== 'POST') {
+          res.writeHead(405, { allow: 'POST', 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, code: 'method-not-allowed' }))
+          return
+        }
+        const body = await readJsonBody(req)
+        if (body === null || typeof body !== 'object' || !isSafeId(body.sessionId)) {
+          sendJson(res, 400, { ok: false, code: 'bad-args' })
+          return
+        }
+        let result
+        try {
+          result = await deleteSession(deps, body.sessionId)
+        } catch (error) {
+          log('delete failed:', textOf(error !== null && error !== undefined && error.stack))
+          sendJson(res, 500, { ok: false, code: 'internal', detail: textOf(error !== null && error !== undefined && error.message) })
+          return
+        }
+        if (!result.ok) {
+          if (result.code === 'active') {
+            sendJson(res, 409, {
+              ok: false,
+              code: 'active',
+              detail: (result.failures[0] ?? {}).error ?? '',
+              warnings: result.warnings,
+            })
+            return
+          }
+          log('delete incomplete for', body.sessionId, result.failures)
+          sendJson(res, 500, {
+            ok: false,
+            code: result.code ?? 'remove-failed',
+            detail: (result.failures[0] ?? {}).error ?? '',
+            failures: result.failures,
+            warnings: result.warnings,
+          })
+          return
+        }
+        if (result.warnings.length > 0) log('delete warnings for', body.sessionId, result.warnings)
+        sendJson(res, 200, { ok: true, deleted: result.deleted, warnings: result.warnings })
+      },
+    }), 'dsh-session-delete: delete route')
+
+    ctx.effect(() => ctx.webServer.register({
+      kind: 'exact',
+      path: '/dsh-session-delete/ping',
+      handler: (req, res) => {
+        if (rejectRequest(req, res)) return
+        sendJson(res, 200, { ok: true, version: VERSION, artifactDirname: ARTIFACT_DIRNAME })
+      },
+    }), 'dsh-session-delete: ping route')
+
+    ctx.effect(() => ctx.on('agent/created', async ({ agent }) => {
+      try {
+        await setupAgentArtifacts(deps, agent)
+      } catch (error) {
+        log('session artifact setup failed:', textOf(error !== null && error !== undefined && error.message))
+      }
+    }), 'dsh-session-delete: session artifacts')
+
+    ctx.effect(() => {
+      const timer = setTimeout(() => {
+        reconcile(deps).catch((error) => log('reconcile failed:', textOf(error !== null && error !== undefined && error.message)))
+      }, 500)
+      return () => clearTimeout(timer)
+    }, 'dsh-session-delete: startup reconcile')
+
+    log(`host ready v${VERSION}: POST /dsh-session-delete/delete, GET /ping`)
+  },
+}
+
+/** 测试与排障入口（插件加载器只消费 default export）。 */
+export const __internals = {
+  VERSION,
+  ARTIFACT_DIRNAME,
+  deleteSession,
+  reconcile,
+  collectHeaders,
+  headerOf,
+  collectDescendants,
+  artifactDirFor,
+  projCachePath,
+  resolveArtifactOwner,
+  setupAgentArtifacts,
+  artifactPromptText,
+  isSafeId,
+}

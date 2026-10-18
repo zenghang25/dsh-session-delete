@@ -1,8 +1,8 @@
 {
   "name": "dsh-session-delete",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
-  "description": "Delete one conversation (Session) from the Harness sidebar by moving its local log records to the Windows Recycle Bin",
+  "description": "One-click session deletion for the Harness sidebar: permanently removes the session logs, projection cache and its per-conversation artifact directory (.dsh-sessions/<session-id>/) after stopping running work.",
   "type": "module",
   "main": "./index.js",
   "exports": {
@@ -29,6 +29,7 @@
     "client.js",
     "cordis.patch.yml",
     "README.md",
+    "LICENSE",
     "icon.svg",
     "locale/*.json"
   ],
@@ -47,7 +48,8 @@
     "cordis",
     "plugin",
     "session",
-    "delete"
+    "delete",
+    "artifacts"
   ],
   "license": "MIT"
 }
