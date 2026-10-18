@@ -401,7 +401,7 @@ try {
     const res = await callRoute(harness.routes, '/dsh-session-delete/ping', {})
     assert.equal(res.status, 200)
     assert.equal(res.payload.ok, true)
-    assert.equal(res.payload.version, '0.4.5')
+    assert.equal(res.payload.version, '0.4.6')
   })
 } finally {
   await fsp.rm(testRoot, { recursive: true, force: true, maxRetries: 3 })

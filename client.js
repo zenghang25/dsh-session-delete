@@ -1,5 +1,5 @@
 /**
- * dsh-session-delete v0.4.5 — 会话删除（Client 半）
+ * dsh-session-delete v0.4.6 — 会话删除（Client 半）
  *
  * 只做一件事：在会话行的「⋯」菜单里注册一个「删除会话」项，点击后直接删除，不弹确认框。
  *
@@ -56,6 +56,68 @@ window.__ModuleLoader__.load({
 			].join('');
 			document.head.appendChild(styleTag);
 
+			/* ---------- 删除过的会话 id：宿主可能仍把 live 会话留在内存里，侧栏会再把它画出来。
+			 *          这里把删除过的行在 CSS 层永久隐藏（id 列表存 localStorage），
+			 *          保证「删除 = 从侧栏消失」，即使宿主还没释放这个会话对象。 ---------- */
+			var HIDDEN_KEY = 'dsh-session-delete.hidden.v1';
+			var hiddenIds = [];
+			try {
+				var storedHidden = typeof localStorage === 'undefined' ? null : localStorage.getItem(HIDDEN_KEY);
+				var parsedHidden = storedHidden === null ? [] : JSON.parse(storedHidden);
+				if (Array.isArray(parsedHidden)) {
+					hiddenIds = parsedHidden.filter(function (id) {
+						return typeof id === 'string' && /^[A-Za-z0-9._-]+$/.test(id);
+					}).slice(-200);
+				}
+			} catch (error) {
+				hiddenIds = [];
+			}
+			function saveHidden() {
+				try {
+					if (typeof localStorage !== 'undefined') localStorage.setItem(HIDDEN_KEY, JSON.stringify(hiddenIds));
+				} catch (error) {}
+			}
+			function hideDeletedRow(id) {
+				if (typeof id !== 'string' || id === '' || !/^[A-Za-z0-9._-]+$/.test(id)) return;
+				try {
+					styleTag.textContent += '[role="treeitem"][data-row-key="session:' + id + '"]{display:none!important;}';
+				} catch (error) {}
+				if (hiddenIds.indexOf(id) === -1) {
+					hiddenIds.push(id);
+					if (hiddenIds.length > 200) hiddenIds = hiddenIds.slice(-200);
+					saveHidden();
+				}
+			}
+			for (var hiddenIndex = 0; hiddenIndex < hiddenIds.length; hiddenIndex += 1) {
+				try {
+					styleTag.textContent += '[role="treeitem"][data-row-key="session:' + hiddenIds[hiddenIndex] + '"]{display:none!important;}';
+				} catch (error) {}
+			}
+
+			/* 兼容清理：旧版本删除过、但宿主仍把 live 会话留在内存里的「幽灵行」。
+			 * 判定：已归档 + live + 不属于任何工作区 + 没有落盘（persisted=false）。 */
+			try {
+				fetch('/dsh-session-delete/diag', { credentials: 'same-origin' }).then(function (response) {
+					return response.json();
+				}).then(function (payload) {
+					if (payload === null || payload === undefined || payload.ok !== true || !Array.isArray(payload.archived)) return;
+					var archived = new Set(payload.archived);
+					var member = new Set();
+					(payload.workspaces || []).forEach(function (workspace) {
+						(workspace.sessionIds || []).forEach(function (id) { member.add(id); });
+					});
+					var persisted = new Set();
+					(payload.queryList || []).forEach(function (record) {
+						if (record !== null && record !== undefined && record.persisted === true) persisted.add(record.id);
+					});
+					(payload.live || []).forEach(function (session) {
+						if (session === null || session === undefined) return;
+						if (!archived.has(session.id) || member.has(session.id) || persisted.has(session.id)) return;
+						hideDeletedRow(session.id);
+					});
+				}).catch(function () {});
+			} catch (error) {}
+
 			var toastTimer = null;
 			function showToast(text, isError) {
 				var el = document.createElement('div');
@@ -81,25 +143,48 @@ window.__ModuleLoader__.load({
 				}
 			}
 
+			function workspacesService() {
+				try {
+					var service = ctx.get('workspaces');
+					return service !== undefined && service !== null ? service : null;
+				} catch (error) {
+					return null;
+				}
+			}
+
 			function forgetDeleted(ids) {
 				var service = sessionsService();
+				var workspaces = workspacesService();
+				var index;
+				/* 1) 先让客户端工作区模型拿到权威归档集合：宿主在删除开始时已经归档该会话，
+				 *    但宿主直接调用 registry 产生的归档变更不一定以命令回包同步到客户端；
+				 *    补一次官方 archiveSession（已归档时宿主直接返回集合，不报错），
+				 *    这样「显示已归档」过滤器下也不会再出现它。 */
+				if (workspaces !== null && typeof workspaces.archiveSession === 'function') {
+					for (index = 0; index < ids.length; index += 1) {
+						try {
+							Promise.resolve(workspaces.archiveSession(ids[index])).catch(function () {});
+						} catch (error) {}
+					}
+				}
+				/* 2) 立刻从本地会话列表摘行 + CSS 隐藏该行（双保险）。 */
+				for (index = 0; index < ids.length; index += 1) hideDeletedRow(ids[index]);
 				if (service === null) return;
-				try {
-					if (typeof service.handleSessionRemoved === 'function') {
-						for (var index = 0; index < ids.length; index += 1) {
-							try {
-								service.handleSessionRemoved(ids[index]);
-							} catch (error) {
-								console.error('[dsh-session-delete] local removal', ids[index], error);
-							}
+				function removeLocally() {
+					if (typeof service.handleSessionRemoved !== 'function') return;
+					for (var row = 0; row < ids.length; row += 1) {
+						try {
+							service.handleSessionRemoved(ids[row]);
+						} catch (error) {
+							console.error('[dsh-session-delete] local removal', ids[row], error);
 						}
 					}
-				} catch (error) {
-					console.error('[dsh-session-delete] local removal', error);
 				}
+				removeLocally();
 				try {
 					if (typeof service.refresh === 'function') {
-						Promise.resolve(service.refresh()).catch(function (error) {
+						/* 刷新会把宿主持有的 live 会话重新列出来，所以刷新完成后再摘一次。 */
+						Promise.resolve(service.refresh()).then(removeLocally, function (error) {
 							console.error('[dsh-session-delete] list refresh', error);
 						});
 					}
@@ -205,7 +290,7 @@ window.__ModuleLoader__.load({
 				};
 			}, 'dsh-session-delete: client cleanup');
 
-			console.log('[dsh-session-delete] client ready v0.4.5, lang=' + localeId);
+			console.log('[dsh-session-delete] client ready v0.4.6, lang=' + localeId);
 		}
 
 		exports.apply = apply;

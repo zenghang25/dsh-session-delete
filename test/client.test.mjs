@@ -46,6 +46,17 @@ const document = {
 }
 globalThis.document = document
 
+/* localStorage 桩：记录「删除后永久隐藏」的 id 列表 */
+const storage = new Map()
+globalThis.localStorage = {
+  getItem(key) {
+    return storage.has(key) ? storage.get(key) : null
+  },
+  setItem(key, value) {
+    storage.set(key, String(value))
+  },
+}
+
 /* ---------------- 模块加载器桩 ---------------- */
 const React = {
   createElement(type, props, ...children) {
@@ -92,6 +103,13 @@ const sessions = {
     return Promise.resolve()
   },
 }
+const workspacesArchived = []
+const workspaces = {
+  archiveSession(id) {
+    workspacesArchived.push(id)
+    return Promise.resolve()
+  },
+}
 const ctx = {
   slots: {
     inject(key, callback) {
@@ -114,7 +132,9 @@ const ctx = {
   },
   sessions,
   get(name) {
-    return name === 'sessions' ? sessions : undefined
+    if (name === 'sessions') return sessions
+    if (name === 'workspaces') return workspaces
+    return undefined
   },
   effect(fn) {
     const dispose = fn()
@@ -169,8 +189,12 @@ assert.equal(fetches.length, 1, '调用了一次 Host 接口')
 assert.equal(fetches[0].url, '/dsh-session-delete/delete')
 assert.equal(fetches[0].init.method, 'POST')
 assert.ok(String(fetches[0].init.body).includes('"s1"'), '请求体带 sessionId')
-assert.deepEqual(sessions.removed, ['s1'], '本地会话模型已摘行')
+assert.ok(sessions.removed.includes('s1'), '本地会话模型已摘行')
 assert.equal(sessions.refreshes, 1, '触发了一次列表刷新')
+assert.deepEqual(workspacesArchived, ['s1'], '删除后同步客户端归档集合')
+const styleTag = document.head.children.find((el) => el.tagName === 'STYLE')
+assert.ok(styleTag.textContent.includes('data-row-key="session:s1"'), '删除过的行被 CSS 永久隐藏')
+assert.ok(storage.get('dsh-session-delete.hidden.v1').includes('s1'), '隐藏 id 已持久化')
 assert.ok(document.body.children.some((el) => String(el.attributes.class).includes('dsd-toast')), '出现成功提示')
 assert.ok(!document.body.children.some((el) => String(el.attributes.class).includes('dsd-toast-error')), '成功时不显示错误样式')
 

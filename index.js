@@ -32,7 +32,7 @@ import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 
 const MODULE = '[dsh-session-delete]'
-const VERSION = '0.4.5'
+const VERSION = '0.4.6'
 /** 会话产出目录名：放在工作目录下，与工作区内容区分。 */
 const ARTIFACT_DIRNAME = '.dsh-sessions'
 /** 请求体上限：唯一合法的请求体就是一个小对象。 */
